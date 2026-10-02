@@ -80,6 +80,28 @@ impl ChannelReconstructor {
         if layers.is_empty() {
             return Err(DecodeError::InvalidDescriptors("no channel layers".into()));
         }
+        // Expanded layout 0, the LFE alone: rendered as 7.1.4 with every
+        // other channel empty (IAMF §7.3.2.1).
+        if let [layer] = layers {
+            if layer.loudspeaker_layout == 15 && layer.expanded_loudspeaker_layout == Some(0) {
+                let layout = 7;
+                let channels_out = rendering_channels(layout)
+                    .ok_or(DecodeError::InvalidDescriptors("bad layout".into()))?
+                    .to_vec();
+                let matrix = loudspeaker_info(layout)
+                    .ok_or(DecodeError::InvalidDescriptors("bad layout".into()))?
+                    .matrix;
+                let mut demixer = Demixer::new(vec![Channel::Lfe], channels_out, Vec::new());
+                demixer.fill_silent();
+                return Ok(ChannelReconstructor {
+                    demixer,
+                    layer: 0,
+                    layout,
+                    input_channels: 1,
+                    matrix,
+                });
+            }
+        }
         for layer in layers {
             if layer.expanded_loudspeaker_layout.is_some() || layer.loudspeaker_layout > 8 {
                 return Err(DecodeError::Unimplemented(
@@ -405,6 +427,37 @@ mod tests {
             .unwrap();
         assert_eq!(out[0], vec![1.0, 2.0]);
         assert_eq!(out[1], vec![-1.0, -2.0]);
+    }
+
+    #[test]
+    fn expanded_lfe_renders_as_714_with_only_its_lfe() {
+        // Expanded layout 0: one mono substream, the LFE of 7.1.4, rendered
+        // as 7.1.4 with every other channel empty (IAMF §7.3.2.1).
+        let mut lfe = layer(15, 1, 0);
+        lfe.expanded_loudspeaker_layout = Some(0);
+        let mut rec = ChannelReconstructor::new(&[lfe], SoundSystem::J).unwrap();
+        assert_eq!(rec.input_channels(), 1);
+        assert_eq!(rec.layout(), 7);
+        let out = rec.process_frame(&[vec![0.5, -0.25]]).unwrap();
+        assert_eq!(out.len(), 12);
+        for (channel, plane) in out.iter().enumerate() {
+            let want = if channel == 3 {
+                vec![0.5, -0.25]
+            } else {
+                vec![0.0, 0.0]
+            };
+            assert_eq!(plane, &want, "channel {channel}");
+        }
+    }
+
+    #[test]
+    fn other_expanded_layouts_are_still_unimplemented() {
+        let mut top = layer(15, 2, 1);
+        top.expanded_loudspeaker_layout = Some(6);
+        assert!(matches!(
+            ChannelReconstructor::new(&[top], SoundSystem::J),
+            Err(DecodeError::Unimplemented(_))
+        ));
     }
 
     #[test]
