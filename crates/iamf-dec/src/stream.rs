@@ -164,6 +164,23 @@ pub struct DecodedObject {
     pub positions: Vec<(u32, ObjectPosition)>,
 }
 
+/// One channel-based element over one temporal unit, handed out in its own
+/// loudspeaker layout instead of rendered into the mix
+/// ([`StreamDecoder::split_element`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedElement {
+    /// The audio element it is.
+    pub audio_element_id: u32,
+    /// The `loudspeaker_layout` (§3.7.4) of the layer it is decoded at: the
+    /// element's highest layer.
+    pub loudspeaker_layout: u8,
+    /// One plane per channel of that layout, in its rendering order
+    /// (§7.2 `channel_layout`, e.g. L, R, C, LFE, Ltf, Rtf for 3.1.2),
+    /// after the element and output mix gains, the element gain offset,
+    /// loudness normalization and the unit's trimming.
+    pub planes: Vec<Vec<f32>>,
+}
+
 /// Mix presentation selection (iamf-tools `RequestedMix` shape).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -407,6 +424,8 @@ struct UnitScratch {
     mixed: Vec<Vec<f32>>,
     /// The unit's objects, until the whole unit is known.
     objects: Vec<DecodedObject>,
+    /// The unit's split elements, likewise.
+    elements: Vec<DecodedElement>,
     /// The interleaved unit, behind the byte API.
     interleaved: Vec<f32>,
     /// Sample buffers for the next decoded frames and planes.
@@ -434,6 +453,9 @@ struct SlotState {
     gain_cursor: GainCursor,
     /// IAMF v2.0 element gain offset, linear (1.0 when absent).
     gain_offset: f32,
+    /// Handed out in its own layout rather than rendered into the mix
+    /// ([`StreamDecoder::split_element`]).
+    split: bool,
     /// Position timeline of an object-based element.
     position: Option<crate::position::PositionCursor>,
     sample_rate: u32,
@@ -535,6 +557,8 @@ pub struct StreamDecoder {
     parsed: Descriptors,
     /// Objects of the last pulled temporal unit (object passthrough).
     objects: Vec<DecodedObject>,
+    /// Split elements of the last pulled temporal unit.
+    elements: Vec<DecodedElement>,
 }
 
 impl StreamDecoder {
@@ -676,6 +700,7 @@ impl StreamDecoder {
                 gain_offset: sub_element.element_gain_offset.map_or(1.0, |offset| {
                     crate::params::q78_db_to_linear(offset.default_q78())
                 }),
+                split: false,
                 position: match &element.config {
                     AudioElementConfig::ObjectBased { num_objects } => {
                         Some(object_position_cursor(sub_element, *num_objects)?)
@@ -733,6 +758,7 @@ impl StreamDecoder {
             scratch: UnitScratch::default(),
             parsed,
             objects: Vec::new(),
+            elements: Vec::new(),
         })
     }
 
@@ -969,6 +995,9 @@ impl StreamDecoder {
         for object in self.objects.drain(..).chain(scratch.objects.drain(..)) {
             scratch.spare.push(object.samples);
         }
+        for element in self.elements.drain(..).chain(scratch.elements.drain(..)) {
+            scratch.spare.extend(element.planes);
+        }
         scratch.spare.append(&mut scratch.planes);
         scratch.spare.append(&mut scratch.ordered);
         scratch.mixed.resize_with(out_channels, Vec::new);
@@ -1057,7 +1086,8 @@ impl StreamDecoder {
                 continue;
             }
 
-            let hrtf = cfg!(feature = "binaural")
+            let hrtf = !slot.split
+                && cfg!(feature = "binaural")
                 && self.target == SoundSystem::Binaural
                 && slot.headphones_rendering_mode == 1;
             // Not if-let-else: the ambisonics arm is a peer case, not a
@@ -1066,8 +1096,13 @@ impl StreamDecoder {
             match &slot.element.config {
                 AudioElementConfig::ChannelBased { layers } => {
                     if slot.reconstructor.is_none() {
-                        let mut rec =
-                            ChannelReconstructor::with_layer_selection(layers, self.target, hrtf)?;
+                        // A split element is not rendered to the target:
+                        // its highest layer, as it is.
+                        let mut rec = ChannelReconstructor::with_layer_selection(
+                            layers,
+                            self.target,
+                            hrtf || slot.split,
+                        )?;
                         for param in &slot.element.params {
                             if let ElementParam::Demixing {
                                 default_demixing_mode,
@@ -1103,6 +1138,31 @@ impl StreamDecoder {
                     // Per-sample element mix gain over the untrimmed unit.
                     slot.gain_cursor
                         .fill(slot.gain_default, frame_len, &mut scratch.gains);
+                    if slot.split {
+                        // Element gains now, output gain and trimming once
+                        // the whole unit is known, as for objects.
+                        let mut planes = Vec::with_capacity(planar.len());
+                        for plane in planar {
+                            let mut samples = scratch.spare.pop().unwrap_or_default();
+                            samples.clear();
+                            samples.extend(
+                                plane
+                                    .iter()
+                                    .zip(&scratch.gains)
+                                    .map(|(&s, &g)| g * slot.gain_offset * s),
+                            );
+                            samples.resize(frame_len, 0.0);
+                            planes.push(samples);
+                        }
+                        scratch.elements.push(DecodedElement {
+                            audio_element_id: slot.element.audio_element_id,
+                            loudspeaker_layout: rec.layout(),
+                            planes,
+                        });
+                        scratch.spare.append(&mut scratch.planes);
+                        scratch.spare.append(&mut scratch.ordered);
+                        continue;
+                    }
                     // The output layout itself, whole: nothing to render.
                     let same_layout = crate::render::is_same_layout(rec.matrix(), target_matrix)
                         && planar.len() == out_channels
@@ -1212,6 +1272,14 @@ impl StreamDecoder {
             object.samples.drain(..start.min(object.samples.len()));
         }
         std::mem::swap(&mut self.objects, &mut scratch.objects);
+        for samples in scratch.elements.iter_mut().flat_map(|e| &mut e.planes) {
+            for (s, &g) in samples.iter_mut().zip(&scratch.out_gains) {
+                *s = *s * g * norm_gain;
+            }
+            samples.truncate(unit_len - end);
+            samples.drain(..start.min(samples.len()));
+        }
+        std::mem::swap(&mut self.elements, &mut scratch.elements);
 
         // Every sample of `out` is written below: what it held is only
         // dropped or zeroed where the unit's size differs from the last.
@@ -1333,6 +1401,7 @@ impl StreamDecoder {
             }
         }
         self.objects.clear();
+        self.elements.clear();
     }
 
     /// The objects of the last temporal unit pulled, in mix order (object
@@ -1359,9 +1428,46 @@ impl StreamDecoder {
     }
 
     /// Whether the selected mix renders anything into the output layout,
-    /// i.e. has elements other than objects.
+    /// i.e. has elements other than objects and split elements.
     pub fn has_rendered_elements(&self) -> bool {
-        self.slots.iter().any(|s| s.position.is_none())
+        self.slots.iter().any(|s| s.position.is_none() && !s.split)
+    }
+
+    /// Hand a channel-based element of the selected mix out in its own
+    /// layout instead of rendering it into the mix: from the next temporal
+    /// unit on, its channels come with each unit in [`Self::elements`],
+    /// with every gain the mix would have applied to it, and the output
+    /// holds the other elements only. Summing the element, rendered to the
+    /// output layout, back into the output gives the mix again (without
+    /// the limiter, which runs on the output alone).
+    ///
+    /// For a player that adjusts the element itself (a dialogue level) or
+    /// places its channels on its own. Returns `false`, changing nothing,
+    /// when the selected mix has no such element or it is not
+    /// channel-based. [`Self::reset_with_new_mix`] forgets the split.
+    pub fn split_element(&mut self, audio_element_id: u32) -> bool {
+        let Some(slot) = self
+            .slots
+            .iter_mut()
+            .find(|s| s.element.audio_element_id == audio_element_id)
+        else {
+            return false;
+        };
+        if !matches!(slot.element.config, AudioElementConfig::ChannelBased { .. }) {
+            return false;
+        }
+        if !slot.split {
+            slot.split = true;
+            // Chosen for the target: rebuilt at its highest layer.
+            slot.reconstructor = None;
+        }
+        true
+    }
+
+    /// The split elements of the last temporal unit pulled, in mix order
+    /// (see [`Self::split_element`]; empty otherwise).
+    pub fn elements(&self) -> &[DecodedElement] {
+        &self.elements
     }
 
     /// Reconfigures for a different mix presentation and/or output layout
