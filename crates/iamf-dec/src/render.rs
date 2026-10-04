@@ -9,17 +9,43 @@ use crate::reconstruct::Reconstructed;
 /// (planar). Same-layout channel input is a passthrough via the identity
 /// matrix in the tables.
 pub fn render(input: &Reconstructed, output: MatrixLayout) -> Result<Vec<Vec<f32>>, DecodeError> {
+    let mut out = Vec::new();
+    render_into(input, output, &mut out)?;
+    Ok(out)
+}
+
+/// [`render`] into planes the caller keeps from one frame to the next.
+pub(crate) fn render_into(
+    input: &Reconstructed,
+    output: MatrixLayout,
+    out: &mut Vec<Vec<f32>>,
+) -> Result<(), DecodeError> {
     match input {
-        Reconstructed::Channels { matrix, planar } => render_m2m(*matrix, output, planar),
-        Reconstructed::Hoa { order, planar } => render_h2m(*order, output, planar),
+        Reconstructed::Channels { matrix, planar } => {
+            render_channels_into(*matrix, output, planar, out)
+        }
+        Reconstructed::Hoa { order, planar } => render_hoa_into(*order, output, planar, out),
     }
 }
 
-fn render_m2m(
+/// Makes `out` `channels` silent planes of `frames` samples, keeping the
+/// planes it already holds.
+fn silence(out: &mut Vec<Vec<f32>>, channels: usize, frames: usize) {
+    out.resize_with(channels, Vec::new);
+    for plane in out.iter_mut() {
+        plane.clear();
+        plane.resize(frames, 0.0);
+    }
+}
+
+/// [`render`] for channel-based planes, into planes the caller keeps from
+/// one frame to the next.
+pub(crate) fn render_channels_into(
     input: MatrixLayout,
     output: MatrixLayout,
     planar: &[Vec<f32>],
-) -> Result<Vec<Vec<f32>>, DecodeError> {
+    out: &mut Vec<Vec<f32>>,
+) -> Result<(), DecodeError> {
     let entry = M2M_TABLE
         .iter()
         .find(|e| e.input == input && e.output == output)
@@ -32,7 +58,7 @@ fn render_m2m(
         )));
     }
     let frames = planar.first().map_or(0, Vec::len);
-    let mut out = vec![vec![0.0f32; frames]; entry.n];
+    silence(out, entry.n, frames);
     for (m, plane) in planar.iter().enumerate() {
         for (n, out_plane) in out.iter_mut().enumerate() {
             let gain = entry.mat[m * entry.n + n];
@@ -44,14 +70,17 @@ fn render_m2m(
             }
         }
     }
-    Ok(out)
+    Ok(())
 }
 
-fn render_h2m(
+/// [`render`] for ambisonics planes, into planes the caller keeps from one
+/// frame to the next.
+fn render_hoa_into(
     order: HoaOrder,
     output: MatrixLayout,
     planar: &[Vec<f32>],
-) -> Result<Vec<Vec<f32>>, DecodeError> {
+    out: &mut Vec<Vec<f32>>,
+) -> Result<(), DecodeError> {
     let entry = H2M_TABLE
         .iter()
         .find(|e| e.input == order && e.output == output)
@@ -64,31 +93,27 @@ fn render_h2m(
         )));
     }
     let frames = planar.first().map_or(0, Vec::len);
-    // Matrix output skips LFE channels; compute the non-LFE channels then
-    // reinsert silent LFE planes at lfe1/lfe2 (libiamf's LFE synthesis
-    // filter is optional and off by default).
-    let mut rendered = vec![vec![0.0f32; frames]; entry.n];
-    for (n, out) in rendered.iter_mut().enumerate() {
+    // The matrix skips the LFE channels: they stay silent at lfe1/lfe2
+    // (libiamf's LFE synthesis filter is optional and off by default), and
+    // the matrix rows fill the other planes in order.
+    silence(out, entry.total_channels, frames);
+    let speakers = out
+        .iter_mut()
+        .enumerate()
+        .filter(|&(i, _)| Some(i) != entry.lfe1 && Some(i) != entry.lfe2)
+        .map(|(_, plane)| plane);
+    for (n, out_plane) in speakers.take(entry.n).enumerate() {
         for (m, plane) in planar.iter().enumerate() {
             let gain = entry.mat[n * entry.m + m];
             if gain == 0.0 {
                 continue;
             }
-            for (o, &s) in out.iter_mut().zip(plane.iter()) {
+            for (o, &s) in out_plane.iter_mut().zip(plane.iter()) {
                 *o += gain * s;
             }
         }
     }
-    let mut out = Vec::with_capacity(entry.total_channels);
-    let mut rendered = rendered.into_iter();
-    for i in 0..entry.total_channels {
-        if Some(i) == entry.lfe1 || Some(i) == entry.lfe2 {
-            out.push(vec![0.0; frames]);
-        } else {
-            out.push(rendered.next().expect("n + lfe count == total_channels"));
-        }
-    }
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]

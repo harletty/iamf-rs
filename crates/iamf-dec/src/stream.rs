@@ -18,8 +18,7 @@ use crate::position::ObjectPosition;
 use crate::post::{LIMITER_LOOKAHEAD, LIMITER_THRESHOLD_DB, PeakLimiter};
 use crate::presentation::Descriptors;
 use crate::profile::{ProfileSet, filter_profiles_for_mix};
-use crate::reconstruct::{ChannelReconstructor, ambisonics_from_planes, deinterleave};
-use crate::render::render;
+use crate::reconstruct::{ChannelReconstructor, ambisonics_from_planes};
 use crate::{CodecFactory, DecodeError, DecodedFrame, SubstreamDecoder};
 
 /// Output PCM encoding (iamf-tools `OutputSampleType`).
@@ -349,6 +348,46 @@ impl GainCursor {
         }
         gain
     }
+
+    /// The next `len` per-sample gains, replacing what `out` holds.
+    fn fill(&mut self, default: f32, len: usize, out: &mut Vec<f32>) {
+        out.clear();
+        if self.queue.is_empty() {
+            out.resize(len, default);
+        } else {
+            out.extend((0..len).map(|_| self.next(default)));
+        }
+    }
+}
+
+/// Decoded-frame buffers kept for the next frames: enough for the frames
+/// of a few temporal units in flight, whatever the caller's pull rhythm.
+const SPARE_BUFFERS: usize = 256;
+
+/// What one temporal unit is rendered through, kept from a unit to the
+/// next so that pulling one allocates nothing in the steady state.
+#[derive(Default)]
+struct UnitScratch {
+    /// The element's frames of the unit, one per substream.
+    frames: Vec<FramePcm>,
+    /// Its decoded channels, in decode order.
+    planes: Vec<Vec<f32>>,
+    /// The same in rendering order, when demixing only reorders them.
+    ordered: Vec<Vec<f32>>,
+    /// The element in the output layout.
+    rendered: Vec<Vec<f32>>,
+    /// Per-sample gains of the element.
+    gains: Vec<f32>,
+    /// Per-sample gains of the output mix.
+    out_gains: Vec<f32>,
+    /// The mix, one plane per rendered channel.
+    mixed: Vec<Vec<f32>>,
+    /// The unit's objects, until the whole unit is known.
+    objects: Vec<DecodedObject>,
+    /// The interleaved unit, behind the byte API.
+    interleaved: Vec<f32>,
+    /// Sample buffers for the next decoded frames and planes.
+    spare: Vec<Vec<f32>>,
 }
 
 struct SlotState {
@@ -468,6 +507,7 @@ pub struct StreamDecoder {
     pending: Vec<u8>,
     frame_size: u32,
     ended: bool,
+    scratch: UnitScratch,
     /// Parsed descriptors, retained for [`StreamDecoder::reset_with_new_mix`].
     parsed: Descriptors,
     /// Objects of the last pulled temporal unit (object passthrough).
@@ -667,6 +707,7 @@ impl StreamDecoder {
             pending: Vec::new(),
             frame_size,
             ended: false,
+            scratch: UnitScratch::default(),
             parsed,
             objects: Vec::new(),
         })
@@ -747,7 +788,10 @@ impl StreamDecoder {
             let Some(index) = slot.substream_ids.iter().position(|&id| id == substream_id) else {
                 continue;
             };
-            let mut out = DecodedFrame::default();
+            let mut out = DecodedFrame {
+                samples: self.scratch.spare.pop().unwrap_or_default(),
+                ..DecodedFrame::default()
+            };
             slot.decoders[index].decode(data, &mut out)?;
             slot.sample_rate = out.sample_rate;
             slot.queues[index].push_back(FramePcm {
@@ -860,27 +904,76 @@ impl StreamDecoder {
     /// Pops and renders one temporal unit as interleaved little-endian PCM
     /// bytes. `None` when no unit is available.
     pub fn get_output_temporal_unit(&mut self) -> Result<Option<Vec<u8>>, DecodeError> {
+        let mut samples = std::mem::take(&mut self.scratch.interleaved);
+        let bytes = self
+            .get_output_temporal_unit_f32(&mut samples)
+            .map(|available| {
+                available.then(|| match self.sample_type {
+                    OutputSampleType::Int16LittleEndian => crate::post::s16_le_bytes(&samples),
+                    OutputSampleType::Int32LittleEndian => crate::post::s32_le_bytes(&samples),
+                })
+            });
+        self.scratch.interleaved = samples;
+        bytes
+    }
+
+    /// Pops and renders one temporal unit into `out` as interleaved f32
+    /// samples, replacing what it holds: what
+    /// [`Self::get_output_temporal_unit`] quantizes, full scale at ±1.0 and
+    /// not clamped. `false`, and an empty `out`, when no unit is available.
+    ///
+    /// The steady state allocates nothing when `out` is kept from one unit
+    /// to the next.
+    pub fn get_output_temporal_unit_f32(
+        &mut self,
+        out: &mut Vec<f32>,
+    ) -> Result<bool, DecodeError> {
+        out.clear();
         if !self.is_temporal_unit_available() {
-            return Ok(None);
+            return Ok(false);
         }
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let rendered = self.render_unit(&mut scratch, out);
+        scratch.spare.truncate(SPARE_BUFFERS);
+        self.scratch = scratch;
+        rendered.map(|()| true)
+    }
+
+    fn render_unit(
+        &mut self,
+        scratch: &mut UnitScratch,
+        out: &mut Vec<f32>,
+    ) -> Result<(), DecodeError> {
         let target_matrix = self.target.matrix_layout();
         let out_channels = self.num_output_channels();
-        let mut mixed: Vec<Vec<f32>> = vec![Vec::new(); out_channels];
         let mut trim: Option<(u32, u32)> = None;
         let mut unit_len: Option<usize> = None;
-        #[allow(clippy::type_complexity)]
-        let mut pending_objects: Vec<(u32, u8, Vec<f32>, Vec<(u32, ObjectPosition)>)> = Vec::new();
+        // The last unit's objects, when the caller left them here, and
+        // whatever a failed unit left behind.
+        for object in self.objects.drain(..).chain(scratch.objects.drain(..)) {
+            scratch.spare.push(object.samples);
+        }
+        scratch.spare.append(&mut scratch.planes);
+        scratch.spare.append(&mut scratch.ordered);
+        scratch.mixed.resize_with(out_channels, Vec::new);
+        for plane in &mut scratch.mixed {
+            plane.clear();
+        }
 
         for slot in &mut self.slots {
-            let frames: Vec<FramePcm> = slot
-                .queues
-                .iter_mut()
-                .map(|q| q.pop_front().expect("unit_ready checked"))
-                .collect();
+            for frame in scratch.frames.drain(..) {
+                scratch.spare.push(frame.samples);
+            }
+            scratch.frames.extend(
+                slot.queues
+                    .iter_mut()
+                    .map(|q| q.pop_front().expect("unit_ready checked")),
+            );
+            let frames = &mut scratch.frames;
             let frame_len = frames[0].samples.len() / usize::from(slot.channels[0].max(1));
             // §3.9: trimming and frame duration are per temporal unit, so
             // every frame of the unit must agree.
-            for frame in &frames {
+            for frame in frames.iter() {
                 if (frame.trim_start, frame.trim_end) != (frames[0].trim_start, frames[0].trim_end)
                 {
                     return Err(DecodeError::CorruptPacket(
@@ -905,9 +998,13 @@ impl StreamDecoder {
             let dmx_mode = slot.dmx_cursor.take_for_unit(frame_len);
             let recon = slot.recon_cursor.take_for_unit(frame_len);
 
-            let mut planes = Vec::new();
-            for (frame, &ch) in frames.iter().zip(&slot.channels) {
-                planes.extend(deinterleave(&frame.samples, usize::from(ch.max(1))));
+            for (frame, &ch) in frames.drain(..).zip(&slot.channels) {
+                crate::reconstruct::deinterleave_frame(
+                    frame.samples,
+                    usize::from(ch.max(1)),
+                    &mut scratch.planes,
+                    &mut scratch.spare,
+                );
             }
 
             if let Some(cursor) = slot.position.as_mut() {
@@ -918,21 +1015,28 @@ impl StreamDecoder {
                 let interval = self.settings.object_position_interval.max(1) as usize;
                 let points: Vec<usize> = (start..frame_len - end).step_by(interval).collect();
                 let positions = cursor.positions_for_unit(frame_len, &points);
-                let gains: Vec<f32> = (0..frame_len)
-                    .map(|_| slot.gain_cursor.next(slot.gain_default) * slot.gain_offset)
-                    .collect();
-                for (index, (plane, track)) in planes.into_iter().zip(positions).enumerate() {
-                    let samples = plane.iter().zip(&gains).map(|(&s, &g)| s * g).collect();
-                    pending_objects.push((
-                        slot.element.audio_element_id,
-                        index as u8,
+                slot.gain_cursor
+                    .fill(slot.gain_default, frame_len, &mut scratch.gains);
+                for gain in &mut scratch.gains {
+                    *gain *= slot.gain_offset;
+                }
+                for (index, (mut samples, track)) in
+                    scratch.planes.drain(..).zip(positions).enumerate()
+                {
+                    for (s, &g) in samples.iter_mut().zip(&scratch.gains) {
+                        *s *= g;
+                    }
+                    samples.truncate(frame_len);
+                    scratch.objects.push(DecodedObject {
+                        audio_element_id: slot.element.audio_element_id,
+                        index: index as u8,
                         samples,
-                        points
+                        positions: points
                             .iter()
                             .map(|&p| (p - start) as u32)
                             .zip(track)
                             .collect(),
-                    ));
+                    });
                 }
                 continue;
             }
@@ -943,7 +1047,7 @@ impl StreamDecoder {
             // Not if-let-else: the ambisonics arm is a peer case, not a
             // fallback.
             #[allow(clippy::single_match_else)]
-            let rendered = match &slot.element.config {
+            match &slot.element.config {
                 AudioElementConfig::ChannelBased { layers } => {
                     if slot.reconstructor.is_none() {
                         let mut rec =
@@ -970,113 +1074,123 @@ impl StreamDecoder {
                     if let Some(recon) = &recon {
                         rec.set_recon_gains(recon);
                     }
-                    let planar = rec.process_frame(&planes)?;
+                    // One layer decoded as it is only needs its planes in
+                    // rendering order; anything else is demixed.
+                    let demixed;
+                    let planar: &[Vec<f32>] =
+                        if rec.reorder_frame(&mut scratch.planes, &mut scratch.ordered) {
+                            &scratch.ordered
+                        } else {
+                            demixed = rec.process_frame(&scratch.planes)?;
+                            &demixed
+                        };
                     #[cfg(feature = "binaural")]
-                    let rendered = if hrtf {
+                    if hrtf {
                         let layout = rec.layout();
-                        binauralize_unit(
+                        scratch.rendered = binauralize_unit(
                             &mut slot.binaural,
                             crate::binaural::BinauralInput::Speakers {
                                 loudspeaker_layout: layout,
                             },
-                            &planar,
+                            planar,
                             frame_len,
                             slot.sample_rate,
-                        )?
+                        )?;
                     } else {
-                        let reconstructed = crate::reconstruct::Reconstructed::Channels {
-                            matrix: rec.matrix(),
+                        crate::render::render_channels_into(
+                            rec.matrix(),
+                            target_matrix,
                             planar,
-                        };
-                        render(&reconstructed, target_matrix)?
-                    };
+                            &mut scratch.rendered,
+                        )?;
+                    }
                     #[cfg(not(feature = "binaural"))]
-                    let rendered = {
-                        let reconstructed = crate::reconstruct::Reconstructed::Channels {
-                            matrix: rec.matrix(),
-                            planar,
-                        };
-                        render(&reconstructed, target_matrix)?
-                    };
-                    rendered
+                    crate::render::render_channels_into(
+                        rec.matrix(),
+                        target_matrix,
+                        planar,
+                        &mut scratch.rendered,
+                    )?;
                 }
                 _ => {
-                    let reconstructed = ambisonics_from_planes(&slot.element.config, planes)?;
+                    let reconstructed = ambisonics_from_planes(
+                        &slot.element.config,
+                        std::mem::take(&mut scratch.planes),
+                    )?;
                     #[cfg(feature = "binaural")]
-                    let rendered = if hrtf {
+                    if hrtf {
                         let hoa = reconstructed.planar();
-                        let order = crate::reconstruct::hoa_order_index(hoa.len());
-                        binauralize_unit(
+                        scratch.rendered = binauralize_unit(
                             &mut slot.binaural,
-                            crate::binaural::BinauralInput::Hoa { order },
+                            crate::binaural::BinauralInput::Hoa {
+                                order: crate::reconstruct::hoa_order_index(hoa.len()),
+                            },
                             hoa,
                             frame_len,
                             slot.sample_rate,
-                        )?
+                        )?;
                     } else {
-                        render(&reconstructed, target_matrix)?
-                    };
+                        crate::render::render_into(
+                            &reconstructed,
+                            target_matrix,
+                            &mut scratch.rendered,
+                        )?;
+                    }
                     #[cfg(not(feature = "binaural"))]
-                    let rendered = render(&reconstructed, target_matrix)?;
-                    rendered
+                    crate::render::render_into(
+                        &reconstructed,
+                        target_matrix,
+                        &mut scratch.rendered,
+                    )?;
+                    scratch.planes = reconstructed.into_planar();
                 }
-            };
+            }
+            scratch.spare.append(&mut scratch.planes);
+            scratch.spare.append(&mut scratch.ordered);
 
             // Per-sample element mix gain over the untrimmed unit.
-            let gains: Vec<f32> = (0..frame_len)
-                .map(|_| slot.gain_cursor.next(slot.gain_default))
-                .collect();
-            for (mix_plane, rendered_plane) in mixed.iter_mut().zip(&rendered) {
+            slot.gain_cursor
+                .fill(slot.gain_default, frame_len, &mut scratch.gains);
+            for (mix_plane, rendered_plane) in scratch.mixed.iter_mut().zip(&scratch.rendered) {
                 if mix_plane.len() < rendered_plane.len() {
                     mix_plane.resize(rendered_plane.len(), 0.0);
                 }
-                for ((o, &s), &g) in mix_plane.iter_mut().zip(rendered_plane).zip(&gains) {
+                for ((o, &s), &g) in mix_plane.iter_mut().zip(rendered_plane).zip(&scratch.gains) {
                     *o += g * slot.gain_offset * s;
                 }
             }
         }
 
         // Output mix gain, then trimming, then loudness normalization and
-        // peak limiting on the f32 signal, then interleave + quantize.
+        // peak limiting on the f32 signal, interleaved.
         let unit_len = unit_len.unwrap_or(0);
         let trim = trim.unwrap_or((0, 0));
-        let out_gains: Vec<f32> = (0..unit_len)
-            .map(|_| self.output_cursor.next(self.output_gain_default))
-            .collect();
+        self.output_cursor
+            .fill(self.output_gain_default, unit_len, &mut scratch.out_gains);
         let (start, end) = self.settings.trimming.window(Some(trim), unit_len);
         let kept = unit_len - start - end;
-        self.objects = pending_objects
-            .into_iter()
-            .map(
-                |(audio_element_id, index, samples, positions)| DecodedObject {
-                    audio_element_id,
-                    index,
-                    samples: samples
-                        .iter()
-                        .zip(&out_gains)
-                        .take(unit_len - end)
-                        .skip(start)
-                        .map(|(&s, &g)| s * g * self.norm_gain)
-                        .collect(),
-                    positions,
-                },
-            )
-            .collect();
-        let mut samples = Vec::with_capacity(kept * out_channels);
-        for (t, &gain) in out_gains
-            .iter()
-            .enumerate()
-            .take(unit_len - end)
-            .skip(start)
-        {
-            for &source in &self.permutation {
-                let sample = mixed
-                    .get(source)
-                    .and_then(|p| p.get(t))
-                    .copied()
-                    .unwrap_or(0.0)
-                    * gain;
-                samples.push(sample * self.norm_gain);
+        let norm_gain = self.norm_gain;
+        for object in &mut scratch.objects {
+            for (s, &g) in object.samples.iter_mut().zip(&scratch.out_gains) {
+                *s = *s * g * norm_gain;
+            }
+            object.samples.truncate(unit_len - end);
+            object.samples.drain(..start.min(object.samples.len()));
+        }
+        std::mem::swap(&mut self.objects, &mut scratch.objects);
+
+        out.resize(kept * out_channels, 0.0);
+        let out_gains = &scratch.out_gains[start..unit_len - end];
+        for (channel, &source) in self.permutation.iter().enumerate() {
+            let Some(plane) = scratch.mixed.get_mut(source) else {
+                continue;
+            };
+            if plane.len() < unit_len {
+                plane.resize(unit_len, 0.0);
+            }
+            let slots = out.iter_mut().skip(channel).step_by(out_channels.max(1));
+            for ((o, &s), &gain) in slots.zip(&plane[start..unit_len - end]).zip(out_gains) {
+                *o = s * gain * norm_gain;
             }
         }
         if self.settings.enable_limiter {
@@ -1093,20 +1207,9 @@ impl StreamDecoder {
             self.limiter
                 .as_mut()
                 .expect("created above")
-                .process_in_place(&mut samples);
+                .process_in_place(out);
         }
-        let mut bytes = Vec::with_capacity(samples.len() * self.sample_type.bytes_per_sample());
-        for &sample in &samples {
-            match self.sample_type {
-                OutputSampleType::Int16LittleEndian => {
-                    bytes.extend(crate::post::quantize_s16(sample).to_le_bytes());
-                }
-                OutputSampleType::Int32LittleEndian => {
-                    bytes.extend(crate::post::quantize_s32(sample).to_le_bytes());
-                }
-            }
-        }
-        Ok(Some(bytes))
+        Ok(())
     }
 
     /// Number of output audio channels rendered for the selected layout.
@@ -1189,6 +1292,13 @@ impl StreamDecoder {
             }
         }
         self.objects.clear();
+    }
+
+    /// The objects of the last temporal unit pulled, in mix order (object
+    /// passthrough; empty otherwise). Left here rather than taken with
+    /// [`Self::take_objects`], their sample buffers serve the next units.
+    pub fn objects(&self) -> &[DecodedObject] {
+        &self.objects
     }
 
     /// The objects of the last temporal unit [`Self::get_output_temporal_unit`]

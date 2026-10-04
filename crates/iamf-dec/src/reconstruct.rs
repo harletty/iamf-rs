@@ -40,6 +40,13 @@ pub enum Reconstructed {
 }
 
 impl Reconstructed {
+    /// The planar channel audio buffers themselves.
+    pub(crate) fn into_planar(self) -> Vec<Vec<f32>> {
+        match self {
+            Reconstructed::Channels { planar, .. } | Reconstructed::Hoa { planar, .. } => planar,
+        }
+    }
+
     /// Returns a slice of the planar channel audio buffers.
     pub fn planar(&self) -> &[Vec<f32>] {
         match self {
@@ -224,6 +231,25 @@ impl ChannelReconstructor {
         }
     }
 
+    /// [`Self::process_frame`] without the copies, when the frame only needs
+    /// its planes reordered: moves them out of `planes` into `ordered`, in
+    /// rendering order, and returns `true`. Otherwise leaves both alone.
+    pub(crate) fn reorder_frame(
+        &self,
+        planes: &mut [Vec<f32>],
+        ordered: &mut Vec<Vec<f32>>,
+    ) -> bool {
+        let Some(map) = self.demixer.reorder_only() else {
+            return false;
+        };
+        if planes.len() < self.input_channels {
+            return false;
+        }
+        ordered.clear();
+        ordered.extend(map.iter().map(|&i| std::mem::take(&mut planes[i])));
+        true
+    }
+
     /// Demixes one frame of planes in decode order (only the first
     /// `input_channels` planes are used, so callers can pass all decoded
     /// channels even when a lower layer was selected).
@@ -245,6 +271,40 @@ pub fn deinterleave(samples: &[f32], channels: usize) -> Vec<Vec<f32>> {
     (0..channels)
         .map(|c| samples.iter().skip(c).step_by(channels).copied().collect())
         .collect()
+}
+
+/// [`deinterleave`] for a decoded frame the caller gives up, appending its
+/// planes to `planes`: a mono frame is its own plane, and the planes of a
+/// wider one, like the buffer it leaves behind, come from and go to
+/// `spare`.
+pub(crate) fn deinterleave_frame(
+    mut samples: Vec<f32>,
+    channels: usize,
+    planes: &mut Vec<Vec<f32>>,
+    spare: &mut Vec<Vec<f32>>,
+) {
+    if channels <= 1 {
+        planes.push(samples);
+        return;
+    }
+    for c in 0..channels {
+        let mut plane = spare.pop().unwrap_or_default();
+        plane.clear();
+        if channels == 2 {
+            // The only wider substream IAMF has: a coupled pair.
+            let pairs = samples.chunks_exact(2);
+            let odd = pairs.remainder().first().copied();
+            plane.extend(pairs.map(|pair| pair[c]));
+            if c == 0 {
+                plane.extend(odd);
+            }
+        } else {
+            plane.extend(samples.iter().skip(c).step_by(channels).copied());
+        }
+        planes.push(plane);
+    }
+    samples.clear();
+    spare.push(samples);
 }
 
 /// ACN channel count → ambisonics order (√n − 1), saturating on empty

@@ -34,6 +34,8 @@ pub(crate) struct Demixer {
     channels_in: Vec<Channel>,
     /// Target layer channels in rendering order.
     channels_out: Vec<Channel>,
+    /// See [`Demixer::reorder_only`].
+    reorder: Option<Vec<usize>>,
     /// See [`Demixer::fill_silent`].
     silent: bool,
     /// (channel, linear gain): output gain to reapply before demixing.
@@ -79,9 +81,18 @@ impl Demixer {
         channels_out: Vec<Channel>,
         output_gains: Vec<(Channel, f32)>,
     ) -> Self {
+        // Where each output channel sits among the transmitted ones (the
+        // last of its kind, as `demix` resolves them), when every one of
+        // them is transmitted and none is asked for twice.
+        let reorder = channels_out
+            .iter()
+            .map(|out| channels_in.iter().rposition(|ch| ch == out))
+            .collect::<Option<Vec<usize>>>()
+            .filter(|map| (0..map.len()).all(|i| !map[..i].contains(&map[i])));
         Demixer {
             channels_in,
             channels_out,
+            reorder,
             output_gains,
             recon_gains: Vec::new(),
             recon_flags: 0,
@@ -92,6 +103,16 @@ impl Demixer {
             last_sfavg: [1.0; CHANNEL_COUNT],
             silent: false,
         }
+    }
+
+    /// When demixing a frame would only reorder its planes — every output
+    /// channel transmitted, no output or recon gain to apply — the
+    /// transmitted plane each output channel is, in output order.
+    pub(crate) fn reorder_only(&self) -> Option<&[usize]> {
+        if self.silent || !self.output_gains.is_empty() || !self.recon_gains.is_empty() {
+            return None;
+        }
+        self.reorder.as_deref()
     }
 
     /// Output channels that are not transmitted come out silent instead of

@@ -37,6 +37,24 @@ pub fn quantize_s32(sample: f32) -> i32 {
     ((scaled + SHIFT) - SHIFT) as i32
 }
 
+/// Interleaved f32 samples → s16le bytes.
+pub(crate) fn s16_le_bytes(samples: &[f32]) -> Vec<u8> {
+    let mut bytes = vec![0u8; samples.len() * 2];
+    for (out, &sample) in bytes.chunks_exact_mut(2).zip(samples) {
+        out.copy_from_slice(&quantize_s16(sample).to_le_bytes());
+    }
+    bytes
+}
+
+/// Interleaved f32 samples → s32le bytes.
+pub(crate) fn s32_le_bytes(samples: &[f32]) -> Vec<u8> {
+    let mut bytes = vec![0u8; samples.len() * 4];
+    for (out, &sample) in bytes.chunks_exact_mut(4).zip(samples) {
+        out.copy_from_slice(&quantize_s32(sample).to_le_bytes());
+    }
+    bytes
+}
+
 /// Loudness normalization: constant gain of `target_db - content_db`
 /// (iamf_loudness_process). `content_db` is the mix presentation's
 /// integrated loudness for the rendered layout, Q7.8 → dB.
