@@ -26,6 +26,24 @@ pub(crate) enum ParamKind {
     Position,
 }
 
+/// Output samples per parameter tick: what a subblock's duration is
+/// multiplied by, then truncated, to put it on the sample clock.
+///
+/// Exactly one when the rates agree — the usual case, and the one where any
+/// other factor drifts: libiamf's `(rate + 0.1) / parameter_rate` makes a
+/// subblock of more than ten seconds a sample longer than it is, and a
+/// timeline of them falls behind its audio by a sample per ten seconds.
+/// libiamf only scales when the rates differ, and so does this; then with
+/// its factor. An unknown sample rate (before the first decoded frame of a
+/// codec that only states it there) is taken to agree.
+pub(crate) fn samples_per_tick(sample_rate: u32, parameter_rate: u32) -> f64 {
+    if sample_rate == 0 || sample_rate == parameter_rate {
+        1.0
+    } else {
+        (f64::from(sample_rate) + 0.1) / f64::from(parameter_rate.max(1))
+    }
+}
+
 /// parameter_id → every consumer of that id. IAMF requires unique
 /// parameter ids, but a multimap keeps duplicate-id streams from silently
 /// dropping one consumer's updates.
@@ -505,6 +523,17 @@ mod tests {
             constant_subblock_duration: if mode { 0 } else { 960 },
             subblock_durations: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_tick_is_a_sample_when_the_rates_agree_and_libiamfs_otherwise() {
+        assert_eq!(samples_per_tick(48_000, 48_000), 1.0);
+        assert_eq!(samples_per_tick(0, 48_000), 1.0);
+        assert_eq!(
+            (480_000.0 * samples_per_tick(48_000, 48_000)) as usize,
+            480_000
+        );
+        assert_eq!(samples_per_tick(48_000, 1_000), 48_000.1 / 1_000.0);
     }
 
     #[test]

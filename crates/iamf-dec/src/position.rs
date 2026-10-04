@@ -524,6 +524,32 @@ mod tests {
         assert_eq!(polar(u3[0][0]), (0.0, 0.0, 1.0));
     }
 
+    /// A long standstill ends on its sample. Scaled by libiamf's
+    /// `(rate + 0.1) / parameter_rate` at equal rates, thirty seconds of it
+    /// ran three samples long, and every move after it came late; over a
+    /// film's standstills an element fell hundreds of samples behind.
+    #[test]
+    fn a_long_standstill_ends_on_its_sample() {
+        let mut cursor = PositionCursor::new(&polar_param([0, 0, 127]));
+        let data = |az: u8| {
+            parse_position_data(
+                &mut ByteReader::new(&[0x00, az, 0x00, 0x7f]),
+                PositionKind::Polar,
+                1,
+            )
+            .unwrap()
+        };
+        let scale = crate::params::samples_per_tick(48_000, 48_000);
+        cursor.push(data(0x00), 1_440_000, scale); // front, thirty seconds
+        cursor.push(data(0x2d), 4800, scale); // then +90
+        for _ in 0..300 {
+            let unit = cursor.positions_for_unit(4800, &[4799]);
+            assert_eq!(polar(unit[0][0]).0, 0.0);
+        }
+        let moved = cursor.positions_for_unit(4800, &[0]);
+        assert_eq!(polar(moved[0][0]).0, 90.0);
+    }
+
     #[test]
     fn slerp_crosses_the_rear_by_the_short_way() {
         // 180 to -90 (= 270) is a 90° arc through the rear-right.
