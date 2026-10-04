@@ -18,8 +18,9 @@ bytes → OBU parser → descriptors/params → codec decode (per substream)
 - **`iamf-dec`** — everything after parsing. `element` decodes substreams
   via pluggable codecs; `reconstruct`/`demixer` rebuild scalable channel
   layouts (per-frame state: demix modes, w-index, recon-gain smoothing);
-  `render` applies gain matrices extracted from libiamf v1.1.0
-  (`matrices.rs`, generated — do not edit); `binaural/` is a native port
+  `render` applies gain matrices extracted from the Open Audio Renderer's
+  EAR tables (`matrices.rs`, generated — do not edit; an expanded subset
+  layout takes the rows of its reference layout); `binaural/` is a native port
   of google/obr (SH encoder → HOA bed → partitioned FFT convolution with
   embedded SH-HRIR filters → limiter); `params` evaluates animated gains
   and carries the subblock-granular parameter timelines (`ParamCursor`);

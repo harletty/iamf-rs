@@ -61,11 +61,13 @@ fn check(name: &str, split: u32, layout: u8) {
         };
         assert_eq!(element.audio_element_id, split);
         assert_eq!(element.loudspeaker_layout, layout);
+        assert_eq!(element.expanded_loudspeaker_layout, None);
         let info = loudspeaker_info(layout).unwrap();
         assert_eq!(element.planes.len(), info.channels);
         let rendered = render(
             &Reconstructed::Channels {
                 matrix: info.matrix,
+                rows: None,
                 planar: element.planes.clone(),
             },
             SoundSystem::J.matrix_layout(),

@@ -15,7 +15,7 @@ use crate::channels::{
 };
 use crate::demixer::Demixer;
 use crate::element::SubstreamPcm;
-use crate::layout::{SoundSystem, loudspeaker_info, loudspeaker_sound_system};
+use crate::layout::{SoundSystem, expanded_info, loudspeaker_info, loudspeaker_sound_system};
 use crate::matrices::{HoaOrder, MatrixLayout};
 use crate::params::{ReconGainLayers, q78_db_to_linear};
 
@@ -27,6 +27,10 @@ pub enum Reconstructed {
     Channels {
         /// Layout key for rendering matrices.
         matrix: MatrixLayout,
+        /// When the planes are a subset of `matrix`'s channels (an expanded
+        /// layout), the matrix row of each plane; `None` for all of them,
+        /// in order.
+        rows: Option<&'static [usize]>,
         /// Planar channel sample buffers.
         planar: Vec<Vec<f32>>,
     },
@@ -60,14 +64,39 @@ impl Reconstructed {
 /// + `iamf_stream_scale_demixer_configure`).
 #[derive(Debug)]
 pub struct ChannelReconstructor {
-    demixer: Demixer,
+    rebuild: Rebuild,
     /// Index of the selected layer.
     layer: usize,
-    /// Loudspeaker layout of the selected layer.
+    /// Loudspeaker layout of the selected layer (15 for an expanded one).
     layout: u8,
     /// Total decoded channels for layers 0..=layer, in decode order.
     input_channels: usize,
     matrix: MatrixLayout,
+    /// See [`Reconstructed::Channels`].
+    rows: Option<&'static [usize]>,
+}
+
+/// How a frame's decoded planes become the element's channels.
+#[derive(Debug)]
+// One per element, built once: boxing the demixer would only add an
+// indirection to every frame.
+#[allow(clippy::large_enum_variant)]
+enum Rebuild {
+    /// Scalable channel audio, demixed up to the selected layer.
+    Demix(Demixer),
+    /// An expanded layout: its one layer carries every channel it has, so
+    /// the planes are only put in rendering order — the decoded plane
+    /// each channel is, in that order.
+    Reorder(Vec<usize>),
+}
+
+/// The expanded loudspeaker layout of a channel-based element's layers,
+/// when it has one (§3.6.2: only as the single layer of the element).
+pub(crate) fn expanded_layout(layers: &[ChannelAudioLayer]) -> Option<u8> {
+    layers
+        .first()
+        .filter(|layer| layer.loudspeaker_layout == 15)
+        .and_then(|layer| layer.expanded_loudspeaker_layout)
 }
 
 impl ChannelReconstructor {
@@ -87,30 +116,11 @@ impl ChannelReconstructor {
         if layers.is_empty() {
             return Err(DecodeError::InvalidDescriptors("no channel layers".into()));
         }
-        // Expanded layout 0, the LFE alone: rendered as 7.1.4 with every
-        // other channel empty (IAMF §7.3.2.1).
-        if let [layer] = layers {
-            if layer.loudspeaker_layout == 15 && layer.expanded_loudspeaker_layout == Some(0) {
-                let layout = 7;
-                let channels_out = rendering_channels(layout)
-                    .ok_or(DecodeError::InvalidDescriptors("bad layout".into()))?
-                    .to_vec();
-                let matrix = loudspeaker_info(layout)
-                    .ok_or(DecodeError::InvalidDescriptors("bad layout".into()))?
-                    .matrix;
-                let mut demixer = Demixer::new(vec![Channel::Lfe], channels_out, Vec::new());
-                demixer.fill_silent();
-                return Ok(ChannelReconstructor {
-                    demixer,
-                    layer: 0,
-                    layout,
-                    input_channels: 1,
-                    matrix,
-                });
-            }
+        if layers[0].loudspeaker_layout == 15 {
+            return Self::expanded(layers);
         }
         for layer in layers {
-            if layer.expanded_loudspeaker_layout.is_some() || layer.loudspeaker_layout > 8 {
+            if layer.loudspeaker_layout > 8 {
                 return Err(DecodeError::Unimplemented(
                     "expanded/binaural loudspeaker layouts",
                 ));
@@ -185,11 +195,50 @@ impl ChannelReconstructor {
         }
 
         Ok(ChannelReconstructor {
-            demixer,
+            rebuild: Rebuild::Demix(demixer),
             layer: selected,
             layout,
             input_channels,
             matrix,
+            rows: None,
+        })
+    }
+
+    /// An expanded layout (`loudspeaker_layout` 15): one layer, rendered as
+    /// the layout it names — whole, or as a subset of its reference layout
+    /// (IAMF §7.3.2.1; OAR's EAR renderer).
+    fn expanded(layers: &[ChannelAudioLayer]) -> Result<Self, DecodeError> {
+        let [layer] = layers else {
+            return Err(DecodeError::InvalidDescriptors(
+                "an expanded loudspeaker layout must be the only layer".into(),
+            ));
+        };
+        let info = layer
+            .expanded_loudspeaker_layout
+            .and_then(expanded_info)
+            .ok_or(DecodeError::Unimplemented(
+                "reserved expanded loudspeaker layout",
+            ))?;
+        let coupled = usize::from(layer.coupled_substream_count);
+        let decoded = usize::from(layer.substream_count) + coupled;
+        if coupled > usize::from(layer.substream_count) || decoded != info.channels {
+            return Err(DecodeError::InvalidDescriptors(format!(
+                "expanded loudspeaker layout {} has {} channels, its layer decodes {decoded}",
+                layer.expanded_loudspeaker_layout.unwrap_or_default(),
+                info.channels
+            )));
+        }
+        let mut order = vec![0; info.channels];
+        for (decoded, &position) in info.decoding_map.iter().enumerate() {
+            order[position] = decoded;
+        }
+        Ok(ChannelReconstructor {
+            rebuild: Rebuild::Reorder(order),
+            layer: 0,
+            layout: layer.loudspeaker_layout,
+            input_channels: info.channels,
+            matrix: info.matrix,
+            rows: info.rows,
         })
     }
 
@@ -204,6 +253,12 @@ impl ChannelReconstructor {
         self.matrix
     }
 
+    /// The matrix row of each reconstructed channel when they are a subset
+    /// of [`Self::matrix`]'s (see [`Reconstructed::Channels`]).
+    pub fn rows(&self) -> Option<&'static [usize]> {
+        self.rows
+    }
+
     /// Loudspeaker layout of the selected layer.
     pub fn layout(&self) -> u8 {
         self.layout
@@ -212,22 +267,31 @@ impl ChannelReconstructor {
     /// Updates the demixing mode from a demixing parameter block (dynamic
     /// path: rotates state and steps the w index).
     pub fn set_demixing_mode(&mut self, mode: u8) -> Result<(), DecodeError> {
-        self.demixer.set_demixing_info(mode, -1)
+        match &mut self.rebuild {
+            Rebuild::Demix(demixer) => demixer.set_demixing_info(mode, -1),
+            Rebuild::Reorder(_) => Ok(()),
+        }
     }
 
     /// Sets the default demixing info from the element's parameter
     /// definition (static path).
     pub fn set_default_demixing(&mut self, mode: u8, w_idx: u8) -> Result<(), DecodeError> {
-        self.demixer.set_demixing_info(mode, i32::from(w_idx))
+        match &mut self.rebuild {
+            Rebuild::Demix(demixer) => demixer.set_demixing_info(mode, i32::from(w_idx)),
+            Rebuild::Reorder(_) => Ok(()),
+        }
     }
 
     /// Updates recon gains from a recon-gain parameter block: uses the
     /// selected layer's entry, gains are byte/255.
     pub fn set_recon_gains(&mut self, layers: &ReconGainLayers) {
+        let Rebuild::Demix(demixer) = &mut self.rebuild else {
+            return;
+        };
         if let Some(Some((flags, gains))) = layers.get(self.layer) {
             let linear: Vec<f32> = gains.iter().map(|&g| f32::from(g) / 255.0).collect();
             let pairs = recon_channel_gains(self.layout, *flags, &linear);
-            self.demixer.set_recon_gains(*flags, pairs);
+            demixer.set_recon_gains(*flags, pairs);
         }
     }
 
@@ -239,7 +303,11 @@ impl ChannelReconstructor {
         planes: &mut [Vec<f32>],
         ordered: &mut Vec<Vec<f32>>,
     ) -> bool {
-        let Some(map) = self.demixer.reorder_only() else {
+        let map = match &self.rebuild {
+            Rebuild::Demix(demixer) => demixer.reorder_only(),
+            Rebuild::Reorder(order) => Some(order.as_slice()),
+        };
+        let Some(map) = map else {
             return false;
         };
         if planes.len() < self.input_channels {
@@ -261,7 +329,10 @@ impl ChannelReconstructor {
                 planes.len()
             )));
         }
-        self.demixer.demix(&planes[..self.input_channels])
+        match &mut self.rebuild {
+            Rebuild::Demix(demixer) => demixer.demix(&planes[..self.input_channels]),
+            Rebuild::Reorder(order) => Ok(order.iter().map(|&i| planes[i].clone()).collect()),
+        }
     }
 }
 
@@ -489,34 +560,80 @@ mod tests {
         assert_eq!(out[1], vec![-1.0, -2.0]);
     }
 
-    #[test]
-    fn expanded_lfe_renders_as_714_with_only_its_lfe() {
-        // Expanded layout 0: one mono substream, the LFE of 7.1.4, rendered
-        // as 7.1.4 with every other channel empty (IAMF §7.3.2.1).
-        let mut lfe = layer(15, 1, 0);
-        lfe.expanded_loudspeaker_layout = Some(0);
-        let mut rec = ChannelReconstructor::new(&[lfe], SoundSystem::J).unwrap();
-        assert_eq!(rec.input_channels(), 1);
-        assert_eq!(rec.layout(), 7);
-        let out = rec.process_frame(&[vec![0.5, -0.25]]).unwrap();
-        assert_eq!(out.len(), 12);
-        for (channel, plane) in out.iter().enumerate() {
-            let want = if channel == 3 {
-                vec![0.5, -0.25]
-            } else {
-                vec![0.0, 0.0]
-            };
-            assert_eq!(plane, &want, "channel {channel}");
-        }
+    fn expanded(layout: u8, substreams: u8, coupled: u8) -> ChannelAudioLayer {
+        let mut layer = layer(15, substreams, coupled);
+        layer.expanded_loudspeaker_layout = Some(layout);
+        layer
     }
 
     #[test]
-    fn other_expanded_layouts_are_still_unimplemented() {
-        let mut top = layer(15, 2, 1);
-        top.expanded_loudspeaker_layout = Some(6);
+    fn expanded_lfe_is_row_3_of_714() {
+        // Expanded layout 0: one mono substream, the LFE of 7.1.4, carried
+        // alone and rendered through 7.1.4's LFE row (IAMF §7.3.2.1).
+        let mut rec = ChannelReconstructor::new(&[expanded(0, 1, 0)], SoundSystem::J).unwrap();
+        assert_eq!(rec.input_channels(), 1);
+        assert_eq!(rec.matrix(), MatrixLayout::Iamf714);
+        assert_eq!(rec.rows(), Some(&[3][..]));
+        let out = rec.process_frame(&[vec![0.5, -0.25]]).unwrap();
+        assert_eq!(out, vec![vec![0.5, -0.25]]);
+    }
+
+    #[test]
+    fn expanded_subset_is_put_in_reference_order() {
+        // Top-5ch: decoded Ltf/Rtf, Ltb/Rtb, then TpC; rendered in 7.1.5.4
+        // order Ltf, Rtf, TpC, Ltb, Rtb.
+        let mut rec = ChannelReconstructor::new(&[expanded(19, 3, 2)], SoundSystem::J).unwrap();
+        assert_eq!(rec.matrix(), MatrixLayout::Iamf7154);
+        assert_eq!(rec.rows(), Some(&[8, 9, 10, 11, 12][..]));
+        let planes: Vec<Vec<f32>> = (0..5).map(|i| vec![i as f32]).collect();
+        let out = rec.process_frame(&planes).unwrap();
+        let flat: Vec<f32> = out.iter().map(|p| p[0]).collect();
+        assert_eq!(flat, vec![0.0, 1.0, 4.0, 2.0, 3.0]);
+
+        // The move-only path agrees.
+        let mut planes = planes;
+        let mut ordered = Vec::new();
+        assert!(rec.reorder_frame(&mut planes, &mut ordered));
+        assert_eq!(ordered, out);
+    }
+
+    #[test]
+    fn expanded_whole_layout_uses_its_own_matrix() {
+        // 9.1.6: 7 coupled pairs (FLc/FRc, FL/FR, SiL/SiR, BL/BR, TpFL/TpFR,
+        // TpSiL/TpSiR, TpBL/TpBR) then FC and LFE.
+        let mut rec = ChannelReconstructor::new(&[expanded(8, 9, 7)], SoundSystem::J).unwrap();
+        assert_eq!(rec.matrix(), MatrixLayout::Iamf916);
+        assert_eq!(rec.rows(), None);
+        let planes: Vec<Vec<f32>> = (0..16).map(|i| vec![i as f32]).collect();
+        let out = rec.process_frame(&planes).unwrap();
+        let flat: Vec<f32> = out.iter().map(|p| p[0]).collect();
+        // FL FR FC LFE BL BR FLc FRc SiL SiR TpFL TpFR TpBL TpBR TpSiL TpSiR
+        assert_eq!(
+            flat,
+            vec![
+                2.0, 3.0, 14.0, 15.0, 6.0, 7.0, 0.0, 1.0, 4.0, 5.0, 8.0, 9.0, 12.0, 13.0, 10.0,
+                11.0
+            ]
+        );
+    }
+
+    #[test]
+    fn expanded_layouts_are_checked() {
+        // Reserved value.
         assert!(matches!(
-            ChannelReconstructor::new(&[top], SoundSystem::J),
+            ChannelReconstructor::new(&[expanded(20, 1, 0)], SoundSystem::J),
             Err(DecodeError::Unimplemented(_))
+        ));
+        // Stereo-TB is one coupled pair, not two mono substreams... of
+        // three channels.
+        assert!(matches!(
+            ChannelReconstructor::new(&[expanded(5, 3, 0)], SoundSystem::J),
+            Err(DecodeError::InvalidDescriptors(_))
+        ));
+        // Only ever the single layer of its element.
+        assert!(matches!(
+            ChannelReconstructor::new(&[expanded(5, 1, 1), layer(7, 6, 4)], SoundSystem::J),
+            Err(DecodeError::InvalidDescriptors(_))
         ));
     }
 

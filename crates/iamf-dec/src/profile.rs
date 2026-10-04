@@ -139,7 +139,8 @@ fn filter_audio_element(element: &AudioElement, profiles: &mut ProfileSet) {
                     profiles.remove(ProfileSet::SIMPLE.union(ProfileSet::BASE));
                     match first.expanded_loudspeaker_layout {
                         Some(0..=12) => {}
-                        _ => profiles.remove(ProfileSet::BASE_ENHANCED),
+                        Some(13..=19) => profiles.remove(ProfileSet::BASE_ENHANCED),
+                        _ => *profiles = ProfileSet::empty(),
                     }
                 }
                 // 10..=14 are reserved in v1.1.
@@ -415,7 +416,22 @@ mod tests {
                 expanded_loudspeaker_layout: Some(13), // 10.2.9.3
             }],
         };
-        let set = filter_profiles_for_mix(&mix(&[1], 0), &[element], &configs, ProfileSet::V1);
+        let set =
+            filter_profiles_for_mix(&mix(&[1], 0), &[element.clone()], &configs, ProfileSet::V1);
+        assert!(set.is_empty());
+
+        // Past 19 the values are reserved in every profile.
+        element.config = AudioElementConfig::ChannelBased {
+            layers: vec![ChannelAudioLayer {
+                loudspeaker_layout: 15,
+                substream_count: 1,
+                coupled_substream_count: 0,
+                recon_gain_is_present: false,
+                output_gain: None,
+                expanded_loudspeaker_layout: Some(20),
+            }],
+        };
+        let set = filter_profiles_for_mix(&mix(&[1], 0), &[element], &configs, ProfileSet::all());
         assert!(set.is_empty());
     }
 

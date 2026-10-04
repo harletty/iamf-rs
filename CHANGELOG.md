@@ -8,13 +8,42 @@ Split elements, for a player that adjusts or places an element itself:
   element of the selected mix is handed out in its own layout, at its
   highest layer, instead of rendered into the mix. Its planes come with
   each temporal unit in `StreamDecoder::elements` (`DecodedElement`:
-  element id, `loudspeaker_layout`, one plane per channel in rendering
-  order) after every gain the mix applies to it — element and output mix
+  element id, `loudspeaker_layout` and `expanded_loudspeaker_layout`, one
+  plane per channel in rendering order) after every gain the mix applies to it — element and output mix
   gains, element gain offset, loudness normalization — and the unit's
   trimming; the output holds the other elements. Rendered to the output
   layout and added back, it gives the unsplit mix.
 - Tests: `tools/iamfdec/tests/split.rs` on test_000087 (added to
   `fetch_vectors.sh`), splitting either element.
+
+Expanded loudspeaker layouts (`loudspeaker_layout` 15), all twenty:
+
+- `iamf-dec`: `layout::expanded_info` — 9.1.6, 10.2.9.3 and 7.1.5.4 as
+  whole layouts, and the subsets of 5.1.4, 7.1.4, 9.1.6, 10.2.9.3 and
+  7.1.5.4 (LFE, LFE pair, stereo pairs, Top-1/4/5/6ch, Bottom-3/4ch,
+  3.0ch). A subset carries only its own channels and renders through its
+  reference layout's matrices restricted to their rows
+  (`Reconstructed::Channels::rows`, OAR's custom-layout channel map), so
+  no silent planes are built or mixed. Replaces the LFE-only special case.
+- `matrices.rs` is now generated from the Open Audio Renderer's EAR
+  tables (`tools/extract_matrices.py`), which carry libiamf v1.1's
+  unchanged (all 165 m2m and 75 h2m matrices compared equal) plus the
+  10.2.9.3 and 7.1.5.4 inputs and the 7.1.5.4 output:
+  `MatrixLayout::Iamf7154` and `Iamf10293`.
+- Mix selection without object passthrough excludes the mixes that
+  contain object-based elements, instead of every v2.0-profile mix: a
+  v2.0 stream of channel-based elements (7.1.5.4, 10.2.9.3) now decodes
+  by default. Reserved expanded layouts (20+) are outside every profile.
+- Elements in an expanded layout take the stereo matrices on headphones:
+  the binaural renderer has no virtual speakers for them yet.
+- Checked against all 86 libiamf vectors using expanded layouts: every
+  reference layout of the channel- and scene-based ones within 1–2 LSB,
+  batch and streaming (the vectors with object elements and the 7.1.5.4
+  output layout are out of reach). Tests: five of them in
+  `tools/iamfdec/tests/render.rs` (added to `fetch_vectors.sh`), one in
+  `stream.rs`, plus unit tests (subset rendering equals the reference
+  layout rendered with the other channels silent, for every subset and
+  output).
 
 IAMF v2.0 object-based audio elements, handed out rather than rendered:
 
