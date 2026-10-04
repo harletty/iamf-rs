@@ -28,6 +28,23 @@ pub(crate) fn render_into(
     }
 }
 
+/// Whether rendering `input` channels to `output` leaves them as they are
+/// (the same layout: an identity matrix), so the planes can be used
+/// without going through [`render`].
+pub(crate) fn is_same_layout(input: MatrixLayout, output: MatrixLayout) -> bool {
+    M2M_TABLE
+        .iter()
+        .find(|e| e.input == input && e.output == output)
+        .is_some_and(|entry| {
+            entry.m == entry.n
+                && entry
+                    .mat
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &gain)| gain == if i / entry.n == i % entry.n { 1.0 } else { 0.0 })
+        })
+}
+
 /// Makes `out` `channels` silent planes of `frames` samples, keeping the
 /// planes it already holds.
 fn silence(out: &mut Vec<Vec<f32>>, channels: usize, frames: usize) {

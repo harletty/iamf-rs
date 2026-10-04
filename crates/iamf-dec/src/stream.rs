@@ -360,6 +360,29 @@ impl GainCursor {
     }
 }
 
+/// Adds an element in the output layout to the mix, under its per-sample
+/// gains. The first element to reach a plane is written rather than added
+/// to silence.
+fn mix_element(mixed: &mut [Vec<f32>], rendered: &[Vec<f32>], gains: &[f32], gain_offset: f32) {
+    for (mix_plane, rendered_plane) in mixed.iter_mut().zip(rendered) {
+        if mix_plane.is_empty() {
+            mix_plane.extend(
+                rendered_plane
+                    .iter()
+                    .zip(gains)
+                    .map(|(&s, &g)| g * gain_offset * s),
+            );
+            continue;
+        }
+        if mix_plane.len() < rendered_plane.len() {
+            mix_plane.resize(rendered_plane.len(), 0.0);
+        }
+        for ((o, &s), &g) in mix_plane.iter_mut().zip(rendered_plane).zip(gains) {
+            *o += g * gain_offset * s;
+        }
+    }
+}
+
 /// Decoded-frame buffers kept for the next frames: enough for the frames
 /// of a few temporal units in flight, whatever the caller's pull rhythm.
 const SPARE_BUFFERS: usize = 256;
@@ -928,14 +951,17 @@ impl StreamDecoder {
         &mut self,
         out: &mut Vec<f32>,
     ) -> Result<bool, DecodeError> {
-        out.clear();
         if !self.is_temporal_unit_available() {
+            out.clear();
             return Ok(false);
         }
         let mut scratch = std::mem::take(&mut self.scratch);
         let rendered = self.render_unit(&mut scratch, out);
         scratch.spare.truncate(SPARE_BUFFERS);
         self.scratch = scratch;
+        if rendered.is_err() {
+            out.clear();
+        }
         rendered.map(|()| true)
     }
 
@@ -1084,8 +1110,15 @@ impl StreamDecoder {
                             demixed = rec.process_frame(&scratch.planes)?;
                             &demixed
                         };
+                    // Per-sample element mix gain over the untrimmed unit.
+                    slot.gain_cursor
+                        .fill(slot.gain_default, frame_len, &mut scratch.gains);
+                    // The output layout itself, whole: nothing to render.
+                    let same_layout = crate::render::is_same_layout(rec.matrix(), target_matrix)
+                        && planar.len() == out_channels
+                        && planar.iter().all(|plane| plane.len() == frame_len);
                     #[cfg(feature = "binaural")]
-                    if hrtf {
+                    let rendered: &[Vec<f32>] = if hrtf {
                         let layout = rec.layout();
                         scratch.rendered = binauralize_unit(
                             &mut slot.binaural,
@@ -1096,6 +1129,9 @@ impl StreamDecoder {
                             frame_len,
                             slot.sample_rate,
                         )?;
+                        &scratch.rendered
+                    } else if same_layout {
+                        planar
                     } else {
                         crate::render::render_channels_into(
                             rec.matrix(),
@@ -1103,14 +1139,26 @@ impl StreamDecoder {
                             planar,
                             &mut scratch.rendered,
                         )?;
-                    }
+                        &scratch.rendered
+                    };
                     #[cfg(not(feature = "binaural"))]
-                    crate::render::render_channels_into(
-                        rec.matrix(),
-                        target_matrix,
-                        planar,
-                        &mut scratch.rendered,
-                    )?;
+                    let rendered: &[Vec<f32>] = if same_layout {
+                        planar
+                    } else {
+                        crate::render::render_channels_into(
+                            rec.matrix(),
+                            target_matrix,
+                            planar,
+                            &mut scratch.rendered,
+                        )?;
+                        &scratch.rendered
+                    };
+                    mix_element(
+                        &mut scratch.mixed,
+                        rendered,
+                        &scratch.gains,
+                        slot.gain_offset,
+                    );
                 }
                 _ => {
                     let reconstructed = ambisonics_from_planes(
@@ -1143,22 +1191,18 @@ impl StreamDecoder {
                         &mut scratch.rendered,
                     )?;
                     scratch.planes = reconstructed.into_planar();
+                    slot.gain_cursor
+                        .fill(slot.gain_default, frame_len, &mut scratch.gains);
+                    mix_element(
+                        &mut scratch.mixed,
+                        &scratch.rendered,
+                        &scratch.gains,
+                        slot.gain_offset,
+                    );
                 }
             }
             scratch.spare.append(&mut scratch.planes);
             scratch.spare.append(&mut scratch.ordered);
-
-            // Per-sample element mix gain over the untrimmed unit.
-            slot.gain_cursor
-                .fill(slot.gain_default, frame_len, &mut scratch.gains);
-            for (mix_plane, rendered_plane) in scratch.mixed.iter_mut().zip(&scratch.rendered) {
-                if mix_plane.len() < rendered_plane.len() {
-                    mix_plane.resize(rendered_plane.len(), 0.0);
-                }
-                for ((o, &s), &g) in mix_plane.iter_mut().zip(rendered_plane).zip(&scratch.gains) {
-                    *o += g * slot.gain_offset * s;
-                }
-            }
         }
 
         // Output mix gain, then trimming, then loudness normalization and
@@ -1179,18 +1223,25 @@ impl StreamDecoder {
         }
         std::mem::swap(&mut self.objects, &mut scratch.objects);
 
+        // Every sample of `out` is written below: what it held is only
+        // dropped or zeroed where the unit's size differs from the last.
+        if self.permutation.len() < out_channels {
+            out.clear();
+        }
         out.resize(kept * out_channels, 0.0);
         let out_gains = &scratch.out_gains[start..unit_len - end];
-        for (channel, &source) in self.permutation.iter().enumerate() {
+        for (channel, &source) in self.permutation.iter().enumerate().take(out_channels) {
+            let frames = out.chunks_exact_mut(out_channels);
             let Some(plane) = scratch.mixed.get_mut(source) else {
+                frames.for_each(|frame| frame[channel] = 0.0);
                 continue;
             };
             if plane.len() < unit_len {
                 plane.resize(unit_len, 0.0);
             }
-            let slots = out.iter_mut().skip(channel).step_by(out_channels.max(1));
-            for ((o, &s), &gain) in slots.zip(&plane[start..unit_len - end]).zip(out_gains) {
-                *o = s * gain * norm_gain;
+            let samples = plane[start..unit_len - end].iter().zip(out_gains);
+            for (frame, (&s, &gain)) in frames.zip(samples) {
+                frame[channel] = s * gain * norm_gain;
             }
         }
         if self.settings.enable_limiter {
