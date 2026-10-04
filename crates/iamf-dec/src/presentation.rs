@@ -507,6 +507,9 @@ fn reconstruct_slot(
     } = slot;
     match &element.config {
         AudioElementConfig::ChannelBased { layers } => {
+            // The binaural renderer has no virtual speakers for the
+            // expanded layouts: they take the stereo matrices.
+            let hrtf = hrtf && crate::reconstruct::expanded_layout(layers).is_none();
             let substreams = decoder.finish_frames();
             let sample_rate = substreams.first().map_or(0, |s| s.sample_rate);
 
@@ -616,6 +619,7 @@ fn reconstruct_slot(
             Ok((
                 SlotOutput::Planar(Reconstructed::Channels {
                     matrix: rec.matrix(),
+                    rows: rec.rows(),
                     planar,
                 }),
                 sample_rate,

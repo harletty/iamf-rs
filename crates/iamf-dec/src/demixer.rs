@@ -36,8 +36,6 @@ pub(crate) struct Demixer {
     channels_out: Vec<Channel>,
     /// See [`Demixer::reorder_only`].
     reorder: Option<Vec<usize>>,
-    /// See [`Demixer::fill_silent`].
-    silent: bool,
     /// (channel, linear gain): output gain to reapply before demixing.
     output_gains: Vec<(Channel, f32)>,
     /// (channel, recon gain): smoothed scale of reconstructed channels.
@@ -101,7 +99,6 @@ impl Demixer {
             w_idx: 0,
             last_w_idx: 0,
             last_sfavg: [1.0; CHANNEL_COUNT],
-            silent: false,
         }
     }
 
@@ -109,16 +106,10 @@ impl Demixer {
     /// channel transmitted, no output or recon gain to apply — the
     /// transmitted plane each output channel is, in output order.
     pub(crate) fn reorder_only(&self) -> Option<&[usize]> {
-        if self.silent || !self.output_gains.is_empty() || !self.recon_gains.is_empty() {
+        if !self.output_gains.is_empty() || !self.recon_gains.is_empty() {
             return None;
         }
         self.reorder.as_deref()
-    }
-
-    /// Output channels that are not transmitted come out silent instead of
-    /// being reconstructed: an expanded layout's subset of a larger one.
-    pub(crate) fn fill_silent(&mut self) {
-        self.silent = true;
     }
 
     /// Sets demixing info. `w_idx` in 0..=10 selects the default (static)
@@ -187,16 +178,6 @@ impl Demixer {
             }
         }
 
-        let frames = input.first().map_or(0, Vec::len);
-        if self.silent {
-            return Ok(self
-                .channels_out
-                .iter()
-                .map(|&ch| {
-                    data.planes[ch.index()].map_or_else(|| vec![0.0; frames], <[f32]>::to_vec)
-                })
-                .collect());
-        }
         for c in 0..self.channels_out.len() {
             self.demix_channel(&mut data, self.channels_out[c])?;
         }

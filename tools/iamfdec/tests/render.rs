@@ -189,6 +189,34 @@ fn projection_opus_coupled_to_stereo() {
 /// No reference WAVs exist for sound systems E–H and 9.1.6, so assert
 /// shape and sanity: correct channel count, same duration as the stereo
 /// render, all samples finite, output not silent.
+/// Expanded loudspeaker layouts (§3.6.2): whole (9.1.6, 7.1.5.4,
+/// 10.2.9.3) and as subsets of their reference layout, rendered through
+/// the reference layout's matrices (OAR). One per reference layout.
+#[test]
+fn expanded_916_and_stereo_tb_to_714() {
+    render_case("test_000608", 1, 9, 1);
+}
+
+#[test]
+fn expanded_bottom_3ch_of_10293_to_712() {
+    render_case("test_000829", 1, 10, 1);
+}
+
+#[test]
+fn expanded_top_1ch_of_7154_to_stereo() {
+    render_case("test_000831", 0, 0, 1);
+}
+
+#[test]
+fn expanded_7154_to_714() {
+    render_case("test_000833", 1, 9, 1);
+}
+
+#[test]
+fn expanded_10293_to_71() {
+    render_case("test_001014", 1, 8, 1);
+}
+
 #[test]
 fn extended_sound_systems_render_sanely() {
     let data = require_vectors!(

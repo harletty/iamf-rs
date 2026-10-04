@@ -128,23 +128,11 @@ pub struct StreamSettings {
     /// from [`StreamDecoder::take_objects`], and only the other elements
     /// are rendered into the output layout. Off by default: object
     /// rendering is not implemented, so without this flag mix
-    /// presentations containing objects are not selectable (a v2 stream's
-    /// v1.1 fallback mix, if any, is chosen instead).
+    /// presentations containing objects are not selectable (another mix
+    /// of the stream, if any, is chosen instead).
     pub object_passthrough: bool,
     /// Samples between two object position points in passthrough mode.
     pub object_position_interval: u32,
-}
-
-impl StreamSettings {
-    /// The profiles mix selection may use: without object passthrough,
-    /// only those whose mixes this decoder can render (the v1.1 ones).
-    fn selectable_profiles(&self) -> ProfileSet {
-        if self.object_passthrough {
-            self.requested_profiles
-        } else {
-            self.requested_profiles.intersection(ProfileSet::V1)
-        }
-    }
 }
 
 /// One object of an object-based element over one temporal unit, from
@@ -567,7 +555,7 @@ impl StreamDecoder {
         if let Some(header) = &parsed.sequence_header {
             let declared = ProfileSet::from_profile_number(header.primary_profile)
                 .union(ProfileSet::from_profile_number(header.additional_profile));
-            if !declared.intersects(settings.selectable_profiles()) {
+            if !declared.intersects(settings.requested_profiles) {
                 return Err(DecodeError::UnsupportedProfile(format!(
                     "stream declares profiles {}/{} outside the requested set",
                     header.primary_profile, header.additional_profile
@@ -575,18 +563,29 @@ impl StreamDecoder {
             }
         }
         // iamf-tools semantics: a mix presentation is selectable when it
-        // fits within some requested profile's limits.
+        // fits within some requested profile's limits — and, since objects
+        // are only handed out, not rendered, when it has none or they are
+        // passed through.
+        let has_objects = |mix: &iamf_obu::descriptors::MixPresentation| {
+            mix.sub_mixes.iter().flat_map(|sm| &sm.elements).any(|sub| {
+                parsed.audio_elements.iter().any(|ae| {
+                    ae.audio_element_id == sub.audio_element_id
+                        && matches!(ae.config, AudioElementConfig::ObjectBased { .. })
+                })
+            })
+        };
         let supported: Vec<bool> = parsed
             .mix_presentations
             .iter()
             .map(|mix| {
-                !filter_profiles_for_mix(
-                    mix,
-                    &parsed.audio_elements,
-                    &parsed.codec_configs,
-                    settings.selectable_profiles(),
-                )
-                .is_empty()
+                (settings.object_passthrough || !has_objects(mix))
+                    && !filter_profiles_for_mix(
+                        mix,
+                        &parsed.audio_elements,
+                        &parsed.codec_configs,
+                        settings.requested_profiles,
+                    )
+                    .is_empty()
             })
             .collect();
         let mix_index = select_mix_index(
@@ -1065,6 +1064,9 @@ impl StreamDecoder {
             #[allow(clippy::single_match_else)]
             match &slot.element.config {
                 AudioElementConfig::ChannelBased { layers } => {
+                    // The binaural renderer has no virtual speakers for the
+                    // expanded layouts: they take the stereo matrices.
+                    let hrtf = hrtf && crate::reconstruct::expanded_layout(layers).is_none();
                     if slot.reconstructor.is_none() {
                         let mut rec =
                             ChannelReconstructor::with_layer_selection(layers, self.target, hrtf)?;
@@ -1104,7 +1106,8 @@ impl StreamDecoder {
                     slot.gain_cursor
                         .fill(slot.gain_default, frame_len, &mut scratch.gains);
                     // The output layout itself, whole: nothing to render.
-                    let same_layout = crate::render::is_same_layout(rec.matrix(), target_matrix)
+                    let same_layout = rec.rows().is_none()
+                        && crate::render::is_same_layout(rec.matrix(), target_matrix)
                         && planar.len() == out_channels
                         && planar.iter().all(|plane| plane.len() == frame_len);
                     #[cfg(feature = "binaural")]
@@ -1125,6 +1128,7 @@ impl StreamDecoder {
                     } else {
                         crate::render::render_channels_into(
                             rec.matrix(),
+                            rec.rows(),
                             target_matrix,
                             planar,
                             &mut scratch.rendered,
@@ -1137,6 +1141,7 @@ impl StreamDecoder {
                     } else {
                         crate::render::render_channels_into(
                             rec.matrix(),
+                            rec.rows(),
                             target_matrix,
                             planar,
                             &mut scratch.rendered,

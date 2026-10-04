@@ -103,6 +103,13 @@ fn stream_matches_batch_multi_element() {
     equivalence_case("test_000086", 2);
 }
 
+/// A v2.0 profile stream without objects (an expanded 7.1.5.4 layout) is
+/// selectable without object passthrough.
+#[test]
+fn stream_matches_batch_expanded_layout() {
+    equivalence_case("test_000833", 9);
+}
+
 #[test]
 fn stream_matches_batch_animated_gains() {
     equivalence_case("test_000066", 0);

@@ -24,7 +24,11 @@ OBU parser → codec decoders → element reconstructor → renderer → mixer �
 - Codecs: Opus (pure-Rust, or libopus via `opus-ffi`), LPCM, FLAC, AAC-LC
 - Scalable channel audio: demixing, recon gains, output gain, layer selection
 - Ambisonics, mono and projection modes, orders 1–4
-- Rendering to all 14 loudspeaker sound systems (libiamf v1.1 gain matrices)
+- Rendering to all 14 loudspeaker sound systems (the Open Audio Renderer's
+  EAR gain matrices: libiamf v1.1's, plus the IAMF v2.0 layouts)
+- Expanded loudspeaker layouts 0–19 (base-enhanced and v2.0 profiles):
+  9.1.6, 10.2.9.3 and 7.1.5.4 whole, and their subsets (LFE, stereo pairs,
+  top/bottom groups, 3.0) through their reference layout's matrices
 - Binaural rendering for headphones — native port of [google/obr](https://github.com/google/obr) (layout 14), any supported sample rate
 - Animated mix gains (step/linear/bezier); demixing/recon-gain parameter
   timelines at subblock granularity (blocks may span temporal units)
@@ -39,8 +43,8 @@ OBU parser → codec decoders → element reconstructor → renderer → mixer �
   trim agreement, one codec config / frame size per mix
 - `#![forbid(unsafe_code)]` outside the FFI boundary; parser and full stream decoder fuzzed (CI smoke + local corpus)
 
-Not yet supported: expanded loudspeaker layouts (base-enhanced profile;
-they are profile-filtered but not decodable), output-rate resampling,
+Not yet supported: 7.1.5.4 as an output layout, HRTF binaural rendering
+of expanded layouts (they take the stereo matrices), output-rate resampling,
 rendering object-based elements (the Open Audio Renderer: objects are only
 available through `object_passthrough`), and v2.0 mixes using two codec
 configs.

@@ -1,5 +1,6 @@
 //! Rendering: planar element channels → target sound system channels,
-//! using the gain matrices ported from libiamf v1.1.0.
+//! using the Open Audio Renderer's EAR gain matrices (libiamf v1.1.0's,
+//! plus the IAMF v2.0 layouts).
 
 use crate::DecodeError;
 use crate::matrices::{H2M_TABLE, HoaOrder, M2M_TABLE, MatrixLayout};
@@ -21,9 +22,11 @@ pub(crate) fn render_into(
     out: &mut Vec<Vec<f32>>,
 ) -> Result<(), DecodeError> {
     match input {
-        Reconstructed::Channels { matrix, planar } => {
-            render_channels_into(*matrix, output, planar, out)
-        }
+        Reconstructed::Channels {
+            matrix,
+            rows,
+            planar,
+        } => render_channels_into(*matrix, *rows, output, planar, out),
         Reconstructed::Hoa { order, planar } => render_hoa_into(*order, output, planar, out),
     }
 }
@@ -56,9 +59,12 @@ fn silence(out: &mut Vec<Vec<f32>>, channels: usize, frames: usize) {
 }
 
 /// [`render`] for channel-based planes, into planes the caller keeps from
-/// one frame to the next.
+/// one frame to the next. With `rows`, the planes are a subset of
+/// `input`'s channels and plane `i` takes matrix row `rows[i]` (an
+/// expanded layout's reference layout; OAR's custom-layout `chmap`).
 pub(crate) fn render_channels_into(
     input: MatrixLayout,
+    rows: Option<&[usize]>,
     output: MatrixLayout,
     planar: &[Vec<f32>],
     out: &mut Vec<Vec<f32>>,
@@ -67,16 +73,17 @@ pub(crate) fn render_channels_into(
         .iter()
         .find(|e| e.input == input && e.output == output)
         .ok_or(DecodeError::Unimplemented("no m2m matrix for layout pair"))?;
-    if planar.len() != entry.m {
+    let expected = rows.map_or(entry.m, <[usize]>::len);
+    if planar.len() != expected || rows.is_some_and(|rows| rows.iter().any(|&r| r >= entry.m)) {
         return Err(DecodeError::InvalidDescriptors(format!(
-            "m2m expects {} input channels, got {}",
-            entry.m,
+            "m2m expects {expected} input channels, got {}",
             planar.len()
         )));
     }
     let frames = planar.first().map_or(0, Vec::len);
     silence(out, entry.n, frames);
-    for (m, plane) in planar.iter().enumerate() {
+    for (i, plane) in planar.iter().enumerate() {
+        let m = rows.map_or(i, |rows| rows[i]);
         for (n, out_plane) in out.iter_mut().enumerate() {
             let gain = entry.mat[m * entry.n + n];
             if gain == 0.0 {
@@ -141,6 +148,7 @@ mod tests {
     fn stereo_to_stereo_is_identity() {
         let input = Reconstructed::Channels {
             matrix: MatrixLayout::Stereo,
+            rows: None,
             planar: vec![vec![0.5, -0.5], vec![0.25, -0.25]],
         };
         let out = render(&input, MatrixLayout::Bs2051A).unwrap();
@@ -152,6 +160,7 @@ mod tests {
     fn mono_to_stereo_pans_center() {
         let input = Reconstructed::Channels {
             matrix: MatrixLayout::Mono,
+            rows: None,
             planar: vec![vec![1.0]],
         };
         let out = render(&input, MatrixLayout::Bs2051A).unwrap();
@@ -166,6 +175,7 @@ mod tests {
         planar[2] = vec![1.0];
         let input = Reconstructed::Channels {
             matrix: MatrixLayout::Iamf51,
+            rows: None,
             planar,
         };
         let out = render(&input, MatrixLayout::Bs2051A).unwrap();
