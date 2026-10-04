@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+Split elements, for a player that adjusts or places an element itself:
+
+- `StreamDecoder::split_element(audio_element_id)`: a channel-based
+  element of the selected mix is handed out in its own layout, at its
+  highest layer, instead of rendered into the mix. Its planes come with
+  each temporal unit in `StreamDecoder::elements` (`DecodedElement`:
+  element id, `loudspeaker_layout` and `expanded_loudspeaker_layout`, one
+  plane per channel in rendering order) after every gain the mix applies to it — element and output mix
+  gains, element gain offset, loudness normalization — and the unit's
+  trimming; the output holds the other elements. Rendered to the output
+  layout and added back, it gives the unsplit mix.
+- Tests: `tools/iamfdec/tests/split.rs` on test_000087 (added to
+  `fetch_vectors.sh`), splitting either element.
+
 Expanded loudspeaker layouts (`loudspeaker_layout` 15), all twenty:
 
 - `iamf-dec`: `layout::expanded_info` — 9.1.6, 10.2.9.3 and 7.1.5.4 as
