@@ -16,17 +16,25 @@ pub const LIMITER_LOOKAHEAD: usize = 240;
 
 /// f32 sample → s16, matching libiamf's `FLOAT2INT16` (round half to
 /// even after clamping).
+#[inline]
 pub fn quantize_s16(sample: f32) -> i16 {
-    (sample * 32768.0)
-        .clamp(-32768.0, 32767.0)
-        .round_ties_even() as i16
+    // `round_ties_even` is a libm call per sample on targets without a
+    // rounding instruction (baseline x86-64). The clamped value is within
+    // ±2^15, so moving it by 1.5 × 2^23 lands where consecutive f32 values
+    // are exactly 1 apart: the addition itself rounds to the nearest
+    // integer, ties to even, and the subtraction is exact.
+    const SHIFT: f32 = 12_582_912.0;
+    let scaled = (sample * 32768.0).clamp(-32768.0, 32767.0);
+    ((scaled + SHIFT) - SHIFT) as i16
 }
 
 /// f32 sample → s32 (f64 intermediate so the scale factor is exact).
+#[inline]
 pub fn quantize_s32(sample: f32) -> i32 {
-    (f64::from(sample) * 2_147_483_648.0)
-        .clamp(-2_147_483_648.0, 2_147_483_647.0)
-        .round_ties_even() as i32
+    // As in `quantize_s16`, in f64: within ±2^31, shifted by 1.5 × 2^52.
+    const SHIFT: f64 = 6_755_399_441_055_744.0;
+    let scaled = (f64::from(sample) * 2_147_483_648.0).clamp(-2_147_483_648.0, 2_147_483_647.0);
+    ((scaled + SHIFT) - SHIFT) as i32
 }
 
 /// Loudness normalization: constant gain of `target_db - content_db`
@@ -196,6 +204,59 @@ impl PeakLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shifted rounding is `round_ties_even` for every input: ties,
+    /// both signs, the clamp edges, non-finite values, and a strided sweep
+    /// of all f32 bit patterns.
+    #[test]
+    fn quantizers_round_ties_to_even() {
+        let s16 = |sample: f32| {
+            (sample * 32768.0)
+                .clamp(-32768.0, 32767.0)
+                .round_ties_even() as i16
+        };
+        let s32 = |sample: f32| {
+            (f64::from(sample) * 2_147_483_648.0)
+                .clamp(-2_147_483_648.0, 2_147_483_647.0)
+                .round_ties_even() as i32
+        };
+        let check = |sample: f32| {
+            assert_eq!(quantize_s16(sample), s16(sample), "s16 of {sample:e}");
+            assert_eq!(quantize_s32(sample), s32(sample), "s32 of {sample:e}");
+        };
+        for n in -70_000i32..=70_000 {
+            // Halves of an s16 step: every tie and both of its neighbours.
+            let sample = n as f32 / 65536.0;
+            check(sample);
+            check(f32::from_bits(sample.to_bits() + 1));
+            check(f32::from_bits(sample.to_bits().wrapping_sub(1)));
+            // Halves of an s32 step.
+            check(n as f32 / 4_294_967_296.0);
+        }
+        for sample in [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            0.999_999_94,
+            -0.999_999_94,
+            1.5,
+            -1.5,
+            1.0e9,
+            -1.0e9,
+            f32::MIN_POSITIVE,
+            f32::MAX,
+            f32::MIN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ] {
+            check(sample);
+        }
+        for bits in (0..=u32::MAX).step_by(65_521) {
+            check(f32::from_bits(bits));
+        }
+    }
 
     #[test]
     fn quiet_signal_passes_through() {
