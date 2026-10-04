@@ -373,8 +373,7 @@ fn evaluate_gain_track(
     trim_map: &[UnitTrim],
 ) -> Vec<f32> {
     let total: usize = trim_map.iter().map(|t| t.len).sum();
-    // libiamf scales parameter durations by (rate + 0.1) / parameter_rate.
-    let ratio = (f64::from(sample_rate) + 0.1) / f64::from(parameter_rate.max(1));
+    let ratio = crate::params::samples_per_tick(sample_rate, parameter_rate);
     let mut gains = vec![default_gain; total];
     let mut pos = 0usize;
     'blocks: for block in blocks {
@@ -513,14 +512,9 @@ fn reconstruct_slot(
 
             // Subblock timelines over the sample clock; a block spanning
             // several temporal units applies each subblock to the units it
-            // covers (libiamf scales durations by (rate + 0.1) / param_rate).
-            let scale = |parameter_rate: u32| {
-                if sample_rate == 0 {
-                    1.0
-                } else {
-                    (f64::from(sample_rate) + 0.1) / f64::from(parameter_rate.max(1))
-                }
-            };
+            // covers.
+            let scale =
+                |parameter_rate: u32| crate::params::samples_per_tick(sample_rate, parameter_rate);
             let mut dmx_cursor = crate::params::ParamCursor::default();
             for (block, rate) in &dmx_blocks {
                 for sb in &block.subblocks {

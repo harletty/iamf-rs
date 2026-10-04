@@ -843,18 +843,8 @@ impl StreamDecoder {
             return Ok(());
         };
         let corrupt = |e: Error| DecodeError::CorruptPacket(e.to_string());
-        // libiamf scales parameter durations to the sample clock by
-        // (rate + 0.1) / parameter_rate; before the first decoded frame of
-        // an unknown-rate codec the rates are assumed equal.
-        let ratio = |parameter_rate: u32| {
-            if sample_rate == 0 {
-                1.0
-            } else {
-                (f64::from(sample_rate) + 0.1) / f64::from(parameter_rate.max(1))
-            }
-        };
         for (slot_index, kind, definition) in targets {
-            let scale = ratio(definition.parameter_rate);
+            let scale = crate::params::samples_per_tick(sample_rate, definition.parameter_rate);
             match kind {
                 ParamKind::Demixing => {
                     let block = ParameterBlock::parse(payload, definition, &ParamContext::Demixing)
