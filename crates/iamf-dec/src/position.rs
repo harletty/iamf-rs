@@ -109,6 +109,34 @@ pub struct PositionData {
     pub objects: Vec<[AxisAnimation; 3]>,
 }
 
+/// One subblock of an object's position parameter, as the stream codes it:
+/// what the object does from `offset` for `duration` samples. A consumer
+/// that keeps a stream's moves rather than the positions evaluated along
+/// them (a master set, a renderer with ramps of its own) reads these.
+///
+/// A step holds `to` for the subblock; a linear animation goes from `from`
+/// to `to` over it, along the straight line between them for a cartesian
+/// parameter and along the great-circle arc for a polar one. The Bezier
+/// forms state their ends only: their control point is not carried here,
+/// so they are followed through the evaluated positions.
+///
+/// The subblock may run past the unit; it is stated once, where it starts.
+/// One that began in the samples a unit trims off its start is stated from
+/// the first kept sample, where it then is, for what is left of it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PositionMove {
+    /// Sample offset into the unit's kept samples where the subblock starts.
+    pub offset: u32,
+    /// Samples the subblock lasts from `offset`.
+    pub duration: u32,
+    /// How the object moves over the subblock.
+    pub animation: PositionAnimationType,
+    /// Where the object is when the subblock starts.
+    pub from: ObjectPosition,
+    /// Where it is when the subblock ends: `from` for a step.
+    pub to: ObjectPosition,
+}
+
 /// Parses `PolarParameterData`, `Cart8ParameterData`, ... and their `Dual`
 /// forms: an `animation_type` then bit-packed coordinates.
 pub(crate) fn parse_position_data(
@@ -309,10 +337,16 @@ impl PositionCursor {
     /// Positions of every object at the given sample offsets of the next
     /// `unit_len` samples (offsets ascending, each `< unit_len`), then
     /// advances the clock by `unit_len`. Returns `[object][point]`.
+    ///
+    /// `kept` is the unit's window of kept samples, `start..end`, which its
+    /// trimming leaves; `moves` gets, per object, the subblocks that start
+    /// in that window (see [`PositionMove`]), in order, after what it held.
     pub(crate) fn positions_for_unit(
         &mut self,
         unit_len: usize,
         points: &[usize],
+        kept: (usize, usize),
+        moves: &mut [Vec<PositionMove>],
     ) -> Vec<Vec<ObjectPosition>> {
         let mut out = vec![Vec::with_capacity(points.len()); self.defaults.len()];
         let mut clock = 0usize; // samples of this unit already walked
@@ -322,6 +356,21 @@ impl PositionCursor {
                 // A gap: no block covers the rest of the unit, so the
                 // default holds, and an "inter" animation after it starts
                 // from the default too.
+                if self.carry != self.defaults {
+                    // The gap opens here: a step back to the default.
+                    if let Some(offset) = kept_offset(clock, kept) {
+                        for (o, object) in moves.iter_mut().enumerate() {
+                            let default = to_position(self.kind, self.defaults[o]);
+                            object.push(PositionMove {
+                                offset,
+                                duration: (unit_len - clock.max(kept.0)) as u32,
+                                animation: PositionAnimationType::Step,
+                                from: default,
+                                to: default,
+                            });
+                        }
+                    }
+                }
                 self.carry.clone_from(&self.defaults);
                 for (o, object) in out.iter_mut().enumerate() {
                     let default = to_position(self.kind, self.defaults[o]);
@@ -341,6 +390,10 @@ impl PositionCursor {
                     self.carry.clone()
                 };
                 front.start = Some(start);
+            }
+            if self.offset == 0 {
+                // The subblock starts here.
+                subblock_moves(self.kind, front, clock, kept, moves);
             }
             let remaining = front.samples - self.offset;
             let span = remaining.min(unit_len - clock);
@@ -373,6 +426,54 @@ impl PositionCursor {
             }
         }
         out
+    }
+}
+
+/// Offset into the kept window `kept` of a subblock starting at `clock` of
+/// its unit, or `None` when no kept sample is in a subblock starting there
+/// (it starts past the window) — one starting before the window is clamped
+/// to its first sample.
+fn kept_offset(clock: usize, kept: (usize, usize)) -> Option<u32> {
+    (clock < kept.1).then(|| clock.saturating_sub(kept.0) as u32)
+}
+
+/// State the subblock `sb`, which starts at `clock` of its unit, as a move
+/// of each object, from the first kept sample it covers.
+fn subblock_moves(
+    kind: PositionKind,
+    sb: &QueuedSubblock,
+    clock: usize,
+    kept: (usize, usize),
+    moves: &mut [Vec<PositionMove>],
+) {
+    let Some(offset) = kept_offset(clock, kept) else {
+        return;
+    };
+    // Samples of the subblock before the kept window.
+    let skipped = kept.0.saturating_sub(clock);
+    if skipped >= sb.samples {
+        return;
+    }
+    let start = sb.start.as_ref().expect("resolved before evaluation");
+    for (o, object) in moves.iter_mut().enumerate() {
+        let from = if skipped == 0 {
+            to_position(kind, start[o])
+        } else {
+            evaluate(kind, sb, o, skipped)
+        };
+        let to = if sb.data.animation == PositionAnimationType::Step {
+            from
+        } else {
+            let axes = &sb.data.objects[o];
+            to_position(kind, [0, 1, 2].map(|i| decode_axis(kind, i, axes[i].end)))
+        };
+        object.push(PositionMove {
+            offset,
+            duration: (sb.samples - skipped) as u32,
+            animation: sb.data.animation,
+            from,
+            to,
+        });
     }
 }
 
@@ -459,6 +560,171 @@ mod tests {
         (a - b).abs() < 1e-3
     }
 
+    /// The positions of a unit nothing trims, its moves dropped.
+    fn positions(
+        cursor: &mut PositionCursor,
+        unit_len: usize,
+        points: &[usize],
+    ) -> Vec<Vec<ObjectPosition>> {
+        let mut moves = vec![Vec::new(); cursor.num_objects()];
+        cursor.positions_for_unit(unit_len, points, (0, unit_len), &mut moves)
+    }
+
+    fn cart16_param(default: [i32; 3]) -> PositionParam {
+        PositionParam {
+            base: ParamDefinition {
+                parameter_id: 1,
+                parameter_rate: 48000,
+                mode: true,
+                duration: 0,
+                constant_subblock_duration: 0,
+                subblock_durations: vec![],
+            },
+            kind: PositionKind::Cart16,
+            defaults: vec![default],
+        }
+    }
+
+    fn cart(p: ObjectPosition) -> [f32; 3] {
+        match p {
+            ObjectPosition::Cartesian { x, y, z } => [x, y, z],
+            ObjectPosition::Polar { .. } => panic!("expected cartesian"),
+        }
+    }
+
+    fn step16(at: [i32; 3]) -> PositionData {
+        PositionData {
+            animation: PositionAnimationType::Step,
+            objects: vec![[0, 1, 2].map(|i| AxisAnimation {
+                start: at[i],
+                ..AxisAnimation::default()
+            })],
+        }
+    }
+
+    fn linear16(from: [i32; 3], to: [i32; 3]) -> PositionData {
+        PositionData {
+            animation: PositionAnimationType::Linear,
+            objects: vec![[0, 1, 2].map(|i| AxisAnimation {
+                start: from[i],
+                end: to[i],
+                ..AxisAnimation::default()
+            })],
+        }
+    }
+
+    fn shape(m: PositionMove) -> (u32, u32, PositionAnimationType) {
+        (m.offset, m.duration, m.animation)
+    }
+
+    /// A subblock is stated once, in the unit it starts in, for its whole
+    /// length: a ramp running past the unit is one move, and what follows
+    /// it is stated where it starts in the next.
+    #[test]
+    fn a_subblock_is_one_move_of_the_unit_it_starts_in() {
+        let mut cursor = PositionCursor::new(&cart16_param([0, 32767, 0]));
+        cursor.push(step16([0, 32767, 0]), 500, 1.0);
+        cursor.push(linear16([0, 32767, 0], [32767, 32767, 0]), 1519, 1.0);
+        cursor.push(step16([32767, 32767, 0]), 17, 1.0);
+        cursor.push(step16([32767, 32767, 0]), 4096, 1.0);
+        let mut moves = vec![Vec::new()];
+        cursor.positions_for_unit(1024, &[0, 256, 512, 768], (0, 1024), &mut moves);
+        assert_eq!(moves[0].len(), 2, "{:?}", moves[0]);
+        assert_eq!(shape(moves[0][0]), (0, 500, PositionAnimationType::Step));
+        assert_eq!(cart(moves[0][0].to), [0.0, 1.0, 0.0]);
+        let ramp = moves[0][1];
+        assert_eq!(shape(ramp), (500, 1519, PositionAnimationType::Linear));
+        assert_eq!(cart(ramp.from), [0.0, 1.0, 0.0]);
+        assert_eq!(cart(ramp.to), [1.0, 1.0, 0.0]);
+        // The ramp goes on through the next unit unstated; the step after
+        // it starts at 500 + 1519 - 1024.
+        let mut moves = vec![Vec::new()];
+        cursor.positions_for_unit(1024, &[0], (0, 1024), &mut moves);
+        assert_eq!(moves[0].len(), 2, "{:?}", moves[0]);
+        assert_eq!(shape(moves[0][0]), (995, 17, PositionAnimationType::Step));
+        assert_eq!(
+            shape(moves[0][1]),
+            (1012, 4096, PositionAnimationType::Step)
+        );
+        assert_eq!(cart(moves[0][0].from), [1.0, 1.0, 0.0]);
+        assert_eq!(cart(moves[0][0].to), [1.0, 1.0, 0.0]);
+    }
+
+    /// An "inter" animation starts where the previous subblock ended: that
+    /// is the move's `from`.
+    #[test]
+    fn an_inter_linear_move_starts_where_the_previous_subblock_ended() {
+        let mut cursor = PositionCursor::new(&polar_param([0, 0, 127]));
+        let data = |code: u8, az: u8| {
+            parse_position_data(
+                &mut ByteReader::new(&[code, az, 0x00, 0x7f]),
+                PositionKind::Polar,
+                1,
+            )
+            .unwrap()
+        };
+        cursor.push(data(0x00, 0x2d), 1024, 1.0); // step, +90
+        cursor.push(data(0x03, 0x5a), 1024, 1.0); // inter-linear to 180
+        let _ = positions(&mut cursor, 1024, &[0]);
+        let mut moves = vec![Vec::new()];
+        cursor.positions_for_unit(1024, &[0], (0, 1024), &mut moves);
+        assert_eq!(moves[0].len(), 1);
+        let m = moves[0][0];
+        assert_eq!(shape(m), (0, 1024, PositionAnimationType::InterLinear));
+        assert_eq!(polar(m.from), (90.0, 0.0, 1.0));
+        assert_eq!(polar(m.to), (180.0, 0.0, 1.0));
+    }
+
+    /// A unit trimmed at its start (a codec's pre-skip): a subblock wholly
+    /// in the trimmed samples is not stated; one begun there is stated
+    /// from the first kept sample, where it then is, for what is left.
+    #[test]
+    fn a_move_begun_in_trimmed_samples_is_stated_from_the_first_kept_one() {
+        let mut cursor = PositionCursor::new(&cart16_param([0, 0, 0]));
+        cursor.push(step16([0, 0, 0]), 200, 1.0);
+        cursor.push(linear16([0, 0, 0], [0, 0, 32767]), 1000, 1.0);
+        let mut moves = vec![Vec::new()];
+        cursor.positions_for_unit(960, &[312, 568, 824], (312, 960), &mut moves);
+        assert_eq!(moves[0].len(), 1, "{:?}", moves[0]);
+        let m = moves[0][0];
+        assert_eq!(shape(m), (0, 888, PositionAnimationType::Linear));
+        // Sample 312 is 112 samples into the 1000-sample ramp.
+        assert!((cart(m.from)[2] - 0.112).abs() < 1e-3, "{:?}", m.from);
+        assert_eq!(cart(m.to), [0.0, 0.0, 1.0]);
+    }
+
+    /// A subblock starting past the kept samples (in a unit's trimmed tail)
+    /// is not stated.
+    #[test]
+    fn a_move_starting_in_a_trimmed_tail_is_not_stated() {
+        let mut cursor = PositionCursor::new(&cart16_param([0, 0, 0]));
+        cursor.push(step16([0, 0, 0]), 900, 1.0);
+        cursor.push(step16([0, 32767, 0]), 124, 1.0);
+        let mut moves = vec![Vec::new()];
+        cursor.positions_for_unit(1024, &[0, 256, 512], (0, 800), &mut moves);
+        assert_eq!(moves[0].len(), 1);
+        assert_eq!(shape(moves[0][0]), (0, 900, PositionAnimationType::Step));
+    }
+
+    /// A gap: the first unit no block covers states one step back to the
+    /// default, and the gap's later units state nothing.
+    #[test]
+    fn a_gap_is_one_step_back_to_the_default() {
+        let mut cursor = PositionCursor::new(&cart16_param([0, 32767, 0]));
+        cursor.push(step16([32767, 0, 0]), 1024, 1.0);
+        let mut moves = vec![Vec::new()];
+        cursor.positions_for_unit(1024, &[0], (0, 1024), &mut moves);
+        assert_eq!(moves[0].len(), 1);
+        let mut moves = vec![Vec::new()];
+        cursor.positions_for_unit(1024, &[0], (0, 1024), &mut moves);
+        assert_eq!(moves[0].len(), 1, "{:?}", moves[0]);
+        assert_eq!(shape(moves[0][0]), (0, 1024, PositionAnimationType::Step));
+        assert_eq!(cart(moves[0][0].to), [0.0, 1.0, 0.0]);
+        let mut moves = vec![Vec::new()];
+        cursor.positions_for_unit(1024, &[0], (0, 1024), &mut moves);
+        assert!(moves[0].is_empty(), "{:?}", moves[0]);
+    }
+
     #[test]
     fn parses_the_step_and_inter_linear_blocks_of_test_000800() {
         // Payloads after the parameter id, from the vector's textproto.
@@ -510,17 +776,17 @@ mod tests {
         cursor.push(data(0x03, 0x2d), 1024, 1.0); // to +90
         cursor.push(data(0x03, 0x5a), 1024, 1.0); // to 180
         let points = [0, 512];
-        let u0 = cursor.positions_for_unit(1024, &points);
+        let u0 = positions(&mut cursor, 1024, &points);
         assert!(close(polar(u0[0][0]).0, 0.0) && close(polar(u0[0][1]).0, 0.0));
-        let u1 = cursor.positions_for_unit(1024, &points);
+        let u1 = positions(&mut cursor, 1024, &points);
         assert!(close(polar(u1[0][0]).0, 0.0));
         // Halfway along the horizontal arc from 0 to +90 is +45.
         assert!(close(polar(u1[0][1]).0, 45.0), "{:?}", u1[0][1]);
-        let u2 = cursor.positions_for_unit(1024, &points);
+        let u2 = positions(&mut cursor, 1024, &points);
         assert!(close(polar(u2[0][0]).0, 90.0));
         assert!(close(polar(u2[0][1]).0, 135.0), "{:?}", u2[0][1]);
         // Past the queued blocks the default (front) returns.
-        let u3 = cursor.positions_for_unit(1024, &points);
+        let u3 = positions(&mut cursor, 1024, &points);
         assert_eq!(polar(u3[0][0]), (0.0, 0.0, 1.0));
     }
 
@@ -543,10 +809,10 @@ mod tests {
         cursor.push(data(0x00), 1_440_000, scale); // front, thirty seconds
         cursor.push(data(0x2d), 4800, scale); // then +90
         for _ in 0..300 {
-            let unit = cursor.positions_for_unit(4800, &[4799]);
+            let unit = positions(&mut cursor, 4800, &[4799]);
             assert_eq!(polar(unit[0][0]).0, 0.0);
         }
-        let moved = cursor.positions_for_unit(4800, &[0]);
+        let moved = positions(&mut cursor, 4800, &[0]);
         assert_eq!(polar(moved[0][0]).0, 90.0);
     }
 
@@ -579,8 +845,8 @@ mod tests {
             ]],
         };
         cursor.push(linear, 2048, 1.0);
-        let first = cursor.positions_for_unit(1024, &[0]);
-        let second = cursor.positions_for_unit(1024, &[0]);
+        let first = positions(&mut cursor, 1024, &[0]);
+        let second = positions(&mut cursor, 1024, &[0]);
         assert!(close(polar(first[0][0]).0, 0.0));
         assert!(close(polar(second[0][0]).0, 30.0), "{:?}", second[0][0]);
     }

@@ -5,7 +5,9 @@
 
 use std::collections::VecDeque;
 
-use iamf_obu::descriptors::{AudioElement, AudioElementConfig, CodecConfig, ElementParam, SubMix};
+use iamf_obu::descriptors::{
+    AudioElement, AudioElementConfig, CodecConfig, ElementParam, PositionKind, SubMix,
+};
 use iamf_obu::{AudioFrame, ByteReader, Error, Obu, ObuType};
 
 use crate::element::{FramePcm, substream_channels};
@@ -14,7 +16,7 @@ use crate::params::{
     ParamContext, ParamCursor, ParamIndex, ParamKind, ParameterBlock, ReconGainLayers,
     SubblockData, build_param_index,
 };
-use crate::position::ObjectPosition;
+use crate::position::{ObjectPosition, PositionMove};
 use crate::post::{LIMITER_LOOKAHEAD, LIMITER_THRESHOLD_DB, PeakLimiter};
 use crate::presentation::Descriptors;
 use crate::profile::{ProfileSet, filter_profiles_for_mix};
@@ -150,6 +152,13 @@ pub struct DecodedObject {
     /// Where it is, at sample offsets into `samples` (ascending, the first
     /// at 0, then every `object_position_interval` samples).
     pub positions: Vec<(u32, ObjectPosition)>,
+    /// How its positions are coded: what a coordinate of `positions` and
+    /// `moves` is quantised to.
+    pub position_kind: PositionKind,
+    /// The position subblocks that start in this unit, in order: what the
+    /// stream states the object does, which `positions` evaluates. Empty in
+    /// a unit no subblock starts in.
+    pub moves: Vec<PositionMove>,
 }
 
 /// One channel-based element over one temporal unit, handed out in its own
@@ -1063,14 +1072,22 @@ impl StreamDecoder {
                 let (start, end) = self.settings.trimming.window(trim, frame_len);
                 let interval = self.settings.object_position_interval.max(1) as usize;
                 let points: Vec<usize> = (start..frame_len - end).step_by(interval).collect();
-                let positions = cursor.positions_for_unit(frame_len, &points);
+                let mut moves = vec![Vec::new(); cursor.num_objects()];
+                let positions = cursor.positions_for_unit(
+                    frame_len,
+                    &points,
+                    (start, frame_len - end),
+                    &mut moves,
+                );
+                let position_kind = cursor.kind();
                 slot.gain_cursor
                     .fill(slot.gain_default, frame_len, &mut scratch.gains);
                 for gain in &mut scratch.gains {
                     *gain *= slot.gain_offset;
                 }
-                for (index, (mut samples, track)) in
-                    scratch.planes.drain(..).zip(positions).enumerate()
+                let tracks = positions.into_iter().zip(moves);
+                for (index, (mut samples, (track, moves))) in
+                    scratch.planes.drain(..).zip(tracks).enumerate()
                 {
                     for (s, &g) in samples.iter_mut().zip(&scratch.gains) {
                         *s *= g;
@@ -1085,6 +1102,8 @@ impl StreamDecoder {
                             .map(|&p| (p - start) as u32)
                             .zip(track)
                             .collect(),
+                        position_kind,
+                        moves,
                     });
                 }
                 continue;
