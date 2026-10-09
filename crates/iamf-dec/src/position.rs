@@ -121,8 +121,10 @@ pub struct PositionData {
 /// so they are followed through the evaluated positions.
 ///
 /// The subblock may run past the unit; it is stated once, where it starts.
-/// One that began in the samples a unit trims off its start is stated from
-/// the first kept sample, where it then is, for what is left of it.
+/// One that began in samples a unit trims off its start (a codec's
+/// pre-skip, which may trim whole units) is stated from the first kept
+/// sample it covers, in whichever unit that is, where it then is, for what
+/// is left of it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PositionMove {
     /// Sample offset into the unit's kept samples where the subblock starts.
@@ -284,6 +286,10 @@ pub(crate) struct PositionCursor {
     /// object: the previous subblock's end (its start for a step), or the
     /// default after a gap.
     carry: Vec<[f64; 3]>,
+    /// The front subblock began, and no kept sample of it has been stated
+    /// as a move yet: it began in samples a unit trimmed, and is stated
+    /// from the first kept sample it covers.
+    unstated: bool,
 }
 
 impl PositionCursor {
@@ -299,6 +305,7 @@ impl PositionCursor {
             defaults,
             queue: VecDeque::new(),
             offset: 0,
+            unstated: false,
         }
     }
 
@@ -331,6 +338,7 @@ impl PositionCursor {
     pub(crate) fn clear(&mut self) {
         self.queue.clear();
         self.offset = 0;
+        self.unstated = false;
         self.carry.clone_from(&self.defaults);
     }
 
@@ -357,13 +365,15 @@ impl PositionCursor {
                 // default holds, and an "inter" animation after it starts
                 // from the default too.
                 if self.carry != self.defaults {
-                    // The gap opens here: a step back to the default.
-                    if let Some(offset) = kept_offset(clock, kept) {
+                    // The gap opens here: a step back to the default, from
+                    // its first kept sample.
+                    let first = clock.max(kept.0);
+                    if first < kept.1 {
                         for (o, object) in moves.iter_mut().enumerate() {
                             let default = to_position(self.kind, self.defaults[o]);
                             object.push(PositionMove {
-                                offset,
-                                duration: (unit_len - clock.max(kept.0)) as u32,
+                                offset: (first - kept.0) as u32,
+                                duration: (unit_len - first) as u32,
                                 animation: PositionAnimationType::Step,
                                 from: default,
                                 to: default,
@@ -393,7 +403,12 @@ impl PositionCursor {
             }
             if self.offset == 0 {
                 // The subblock starts here.
-                subblock_moves(self.kind, front, clock, kept, moves);
+                self.unstated = true;
+            }
+            if self.unstated {
+                // Stated from its first kept sample, which may be units
+                // past its start when a codec's pre-skip trims them.
+                self.unstated = !state_subblock(self.kind, front, self.offset, clock, kept, moves);
             }
             let remaining = front.samples - self.offset;
             let span = remaining.min(unit_len - clock);
@@ -407,6 +422,8 @@ impl PositionCursor {
             clock += span;
             self.offset += span;
             if self.offset >= front.samples {
+                // Over, stated or not: one wholly in trimmed samples is not.
+                self.unstated = false;
                 let done = self.queue.pop_front().expect("front exists");
                 let start = done.start.expect("resolved above");
                 self.carry = done
@@ -429,31 +446,25 @@ impl PositionCursor {
     }
 }
 
-/// Offset into the kept window `kept` of a subblock starting at `clock` of
-/// its unit, or `None` when no kept sample is in a subblock starting there
-/// (it starts past the window) — one starting before the window is clamped
-/// to its first sample.
-fn kept_offset(clock: usize, kept: (usize, usize)) -> Option<u32> {
-    (clock < kept.1).then(|| clock.saturating_sub(kept.0) as u32)
-}
-
-/// State the subblock `sb`, which starts at `clock` of its unit, as a move
-/// of each object, from the first kept sample it covers.
-fn subblock_moves(
+/// State the front subblock `sb`, of which `consumed` samples were walked
+/// before `clock` of this unit, as a move of each object from the first
+/// kept sample it covers in the unit. `false` when no kept sample of what
+/// is left of it is in the unit: it is stated in a later one, or never when
+/// it ends in trimmed samples.
+fn state_subblock(
     kind: PositionKind,
     sb: &QueuedSubblock,
+    consumed: usize,
     clock: usize,
     kept: (usize, usize),
     moves: &mut [Vec<PositionMove>],
-) {
-    let Some(offset) = kept_offset(clock, kept) else {
-        return;
-    };
-    // Samples of the subblock before the kept window.
-    let skipped = kept.0.saturating_sub(clock);
-    if skipped >= sb.samples {
-        return;
+) -> bool {
+    let first = clock.max(kept.0);
+    if first >= kept.1 || first >= clock + (sb.samples - consumed) {
+        return false;
     }
+    // Samples of the subblock before the first kept one.
+    let skipped = consumed + (first - clock);
     let start = sb.start.as_ref().expect("resolved before evaluation");
     for (o, object) in moves.iter_mut().enumerate() {
         let from = if skipped == 0 {
@@ -468,13 +479,14 @@ fn subblock_moves(
             to_position(kind, [0, 1, 2].map(|i| decode_axis(kind, i, axes[i].end)))
         };
         object.push(PositionMove {
-            offset,
+            offset: (first - kept.0) as u32,
             duration: (sb.samples - skipped) as u32,
             animation: sb.data.animation,
             from,
             to,
         });
     }
+    true
 }
 
 /// The value of object `o` at sample `n` of subblock `sb`.
@@ -691,6 +703,33 @@ mod tests {
         // Sample 312 is 112 samples into the 1000-sample ramp.
         assert!((cart(m.from)[2] - 0.112).abs() < 1e-3, "{:?}", m.from);
         assert_eq!(cart(m.to), [0.0, 0.0, 1.0]);
+    }
+
+    /// A pre-skip longer than a unit: the subblock is stated in the first
+    /// unit with a kept sample of it, from that sample, not in the unit it
+    /// began in, which has no audio.
+    #[test]
+    fn a_move_begun_units_before_the_first_kept_sample_is_stated_there() {
+        let mut cursor = PositionCursor::new(&cart16_param([0, 0, 0]));
+        cursor.push(linear16([0, 0, 0], [0, 0, 32767]), 2048, 1.0);
+        cursor.push(step16([0, 0, 32767]), 4096, 1.0);
+        let mut moves = vec![Vec::new()];
+        cursor.positions_for_unit(960, &[], (960, 960), &mut moves);
+        assert!(moves[0].is_empty(), "{:?}", moves[0]);
+        let mut moves = vec![Vec::new()];
+        cursor.positions_for_unit(960, &[312, 568, 824], (312, 960), &mut moves);
+        assert_eq!(moves[0].len(), 1, "{:?}", moves[0]);
+        let m = moves[0][0];
+        assert_eq!(shape(m), (0, 776, PositionAnimationType::Linear));
+        // Sample 1272 of the 2048-sample ramp.
+        assert!((cart(m.from)[2] - 0.62109375).abs() < 1e-6, "{:?}", m.from);
+        assert_eq!(cart(m.to), [0.0, 0.0, 1.0]);
+        // The ramp ends 128 samples into the next unit, where the step
+        // after it is stated; nothing of the ramp is stated again.
+        let mut moves = vec![Vec::new()];
+        cursor.positions_for_unit(960, &[0], (0, 960), &mut moves);
+        assert_eq!(moves[0].len(), 1, "{:?}", moves[0]);
+        assert_eq!(shape(moves[0][0]), (128, 4096, PositionAnimationType::Step));
     }
 
     /// A subblock starting past the kept samples (in a unit's trimmed tail)
