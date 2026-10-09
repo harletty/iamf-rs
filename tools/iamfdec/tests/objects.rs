@@ -10,7 +10,7 @@ use iamf_codecs::DefaultFactory;
 use iamf_dec::DecodeError;
 use iamf_dec::layout::SoundSystem;
 use iamf_dec::params::q78_db_to_linear;
-use iamf_dec::position::ObjectPosition;
+use iamf_dec::position::{ObjectPosition, PositionAnimationType};
 use iamf_dec::stream::{DecodedObject, MixSelection, StreamDecoder, StreamSettings};
 
 fn vector(name: &str) -> Option<Vec<u8>> {
@@ -167,6 +167,26 @@ fn polar_object_is_its_source_and_follows_its_blocks() {
         [0.0, 0.0, 1.0],
         "unit 4 default",
     );
+
+    // The blocks themselves, as the moves of the units they start in: a
+    // step at the front, then inter-linear subblocks from where the
+    // previous one ended, and the gap after them a step back to the
+    // default.
+    let moves = |u: usize| &d.units[u].1[0].moves;
+    assert_eq!(moves(0).len(), 1, "{:?}", moves(0));
+    assert_eq!(moves(0)[0].offset, 0);
+    assert_eq!(moves(0)[0].animation, PositionAnimationType::Step);
+    assert_close(polar(moves(0)[0].to), [0.0, 0.0, 1.0], "unit 0 move");
+    assert_eq!(moves(1).len(), 1, "{:?}", moves(1));
+    assert_eq!(moves(1)[0].animation, PositionAnimationType::InterLinear);
+    assert_eq!(moves(1)[0].offset, 0);
+    assert_eq!(moves(1)[0].duration, 1024);
+    assert_close(polar(moves(1)[0].from), [0.0, 0.0, 1.0], "unit 1 from");
+    assert_close(polar(moves(1)[0].to), [90.0, 0.0, 1.0], "unit 1 to");
+    assert_close(polar(moves(2)[0].from), [90.0, 0.0, 1.0], "unit 2 from");
+    assert_eq!(moves(4).len(), 1, "{:?}", moves(4));
+    assert_eq!(moves(4)[0].animation, PositionAnimationType::Step);
+    assert_close(polar(moves(4)[0].to), [0.0, 0.0, 1.0], "unit 4 move");
 }
 
 #[test]
