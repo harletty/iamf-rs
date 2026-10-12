@@ -14,7 +14,8 @@ Raw streams decoded whatever the size of the pushes:
   so with several units in one call a block was applied from the first
   unit not yet pulled, and a gap between two blocks (default values)
   moved to the end of the call. Blocks of units behind others still to
-  be pulled are now held until their unit is pulled.
+  be pulled are parsed as they come and their subblocks held until their
+  unit is pulled, which allocates nothing more for them.
 - Tests: `tools/iamfdec/tests/synthetic.rs`, a gain block with gaps
   around it, pushed whole, per unit, in pairs and in 37-byte pieces, with
   and without delimiters.
