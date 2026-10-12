@@ -311,3 +311,100 @@ fn duplicate_parameter_id_applies_to_all_consumers() {
         );
     }
 }
+
+/// Five units of a constant stereo signal, with one -6 dB element-gain
+/// block that comes in the second unit and covers two: every unit opens
+/// with what `delimiter` returns for it, if anything.
+fn gapped_gain_stream(delimiter: impl Fn(usize) -> Option<u8>) -> (Vec<u8>, Vec<usize>) {
+    let mut stream = descriptors(stereo_element(), mix_presentation(100, 101));
+    let frames: Vec<i16> = (0..FRAME).flat_map(|_| [8192i16, -8192]).collect();
+    let mut unit_starts = Vec::new();
+    for unit in 0..5 {
+        unit_starts.push(stream.len());
+        if let Some(header) = delimiter(unit) {
+            stream.extend([header, 0]);
+        }
+        if unit == 1 {
+            stream.extend(mix_gain_block(100, 2 * FRAME as u32, -256 * 6));
+        }
+        stream.extend(frame_obu(0, &frames));
+    }
+    unit_starts.push(stream.len());
+    (stream, unit_starts)
+}
+
+/// Decodes `stream` pushed in the given pieces, pulling whatever each
+/// piece completes, and returns the left sample of every unit's start.
+fn unit_levels(stream: &[u8], pieces: &[std::ops::Range<usize>]) -> Vec<i16> {
+    let settings = StreamSettings::default();
+    let mut decoder = StreamDecoder::new_from_descriptors(stream, settings, &DefaultFactory)
+        .expect("descriptors");
+    let mut levels = Vec::new();
+    for piece in pieces {
+        decoder.decode(&stream[piece.clone()]).expect("decode");
+        while let Some(unit) = decoder.get_output_temporal_unit().expect("pull") {
+            levels.push(i16::from_le_bytes([unit[0], unit[1]]));
+        }
+    }
+    levels
+}
+
+/// A parameter block starts at the temporal unit it comes in, however
+/// many units one `decode` call brings: the units before and after it
+/// keep the default gain.
+#[test]
+fn a_parameter_block_starts_at_its_own_unit_whatever_the_chunking() {
+    const TEMPORAL_DELIMITER: u8 = 4 << 3;
+    // IAMF v2.0 `is_not_key_frame`, on every unit but the first.
+    let v2_delimiter = |unit: usize| Some(TEMPORAL_DELIMITER | u8::from(unit != 0) << 1);
+    let streams = [
+        gapped_gain_stream(|_| None),
+        gapped_gain_stream(|_| Some(TEMPORAL_DELIMITER)),
+        gapped_gain_stream(v2_delimiter),
+    ];
+    for (stream, unit_starts) in &streams {
+        let whole: Vec<_> = std::iter::once(0..stream.len()).collect();
+        let per_unit: Vec<_> = std::iter::once(0..unit_starts[0])
+            .chain(unit_starts.windows(2).map(|w| w[0]..w[1]))
+            .collect();
+        let odd: Vec<_> = (0..stream.len())
+            .step_by(37)
+            .map(|at| at..(at + 37).min(stream.len()))
+            .collect();
+        // Two units at a time: a block that is neither first nor alone.
+        let pairs = [
+            0..unit_starts[2],
+            unit_starts[2]..unit_starts[4],
+            unit_starts[4]..stream.len(),
+        ];
+        for pieces in [&whole[..], &per_unit, &odd, &pairs] {
+            let levels = unit_levels(stream, pieces);
+            assert_eq!(levels.len(), 5, "every unit decodes");
+            for (unit, &level) in levels.iter().enumerate() {
+                let expected = if (1..3).contains(&unit) { 4106 } else { 8192 };
+                assert!(
+                    (i32::from(level) - expected).abs() <= 2,
+                    "unit {unit} at {level}, expected {expected} ({} pieces)",
+                    pieces.len()
+                );
+            }
+        }
+    }
+}
+
+/// A seek drops the parameter blocks held for units that were never
+/// pulled: they do not reach the units decoded after it.
+#[test]
+fn a_reset_drops_the_held_parameter_blocks() {
+    let (stream, unit_starts) = gapped_gain_stream(|_| None);
+    let settings = StreamSettings::default();
+    let mut decoder =
+        StreamDecoder::new_from_descriptors(&stream, settings, &DefaultFactory).unwrap();
+    // Units 0 and 1 in one call, never pulled: unit 1's block is held.
+    decoder.decode(&stream[..unit_starts[2]]).unwrap();
+    decoder.reset();
+    decoder.decode(&stream[unit_starts[3]..]).unwrap();
+    while let Some(unit) = decoder.get_output_temporal_unit().unwrap() {
+        assert_eq!(i16::from_le_bytes([unit[0], unit[1]]), 8192);
+    }
+}

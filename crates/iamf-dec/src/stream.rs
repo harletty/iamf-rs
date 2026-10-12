@@ -434,6 +434,58 @@ struct UnitScratch {
     spare: Vec<Vec<f32>>,
 }
 
+/// What a parameter subblock drives.
+#[derive(Clone, Copy)]
+enum ParamTarget {
+    /// An element's own parameter: demixing, recon gain, position or its
+    /// mix gain, by the subblock's data.
+    Slot(usize),
+    /// The output mix gain.
+    OutputMix,
+}
+
+/// A parsed parameter subblock on its way to a timeline: appended at once
+/// when its temporal unit is the next to be pulled, held until it is
+/// otherwise.
+struct HeldSubblock {
+    /// The temporal unit its parameter block came in, counted from the
+    /// last reset.
+    unit: u64,
+    target: ParamTarget,
+    data: SubblockData,
+    /// In ticks of the parameter rate.
+    duration: u32,
+    /// Samples per tick.
+    scale: f64,
+}
+
+impl HeldSubblock {
+    fn join_timeline(self, slots: &mut [SlotState], output_cursor: &mut GainCursor) {
+        let samples = (f64::from(self.duration) * self.scale) as usize;
+        match (self.target, self.data) {
+            (ParamTarget::OutputMix, SubblockData::MixGain(anim)) => {
+                output_cursor.push(&anim, samples);
+            }
+            (ParamTarget::Slot(slot), SubblockData::MixGain(anim)) => {
+                slots[slot].gain_cursor.push(&anim, samples);
+            }
+            (ParamTarget::Slot(slot), SubblockData::Demixing { dmixp_mode }) => {
+                slots[slot].dmx_cursor.push(dmixp_mode, samples);
+            }
+            (ParamTarget::Slot(slot), SubblockData::ReconGain(gains)) => {
+                slots[slot].recon_cursor.push(gains, samples);
+            }
+            (ParamTarget::Slot(slot), SubblockData::Position(data)) => {
+                if let Some(cursor) = slots[slot].position.as_mut() {
+                    cursor.push(data, self.duration, self.scale);
+                }
+            }
+            // The parsing context decides the data: no other pairing.
+            (ParamTarget::OutputMix, _) => {}
+        }
+    }
+}
+
 struct SlotState {
     element: AudioElement,
     codec_config: CodecConfig,
@@ -552,6 +604,13 @@ pub struct StreamDecoder {
     limiter: Option<PeakLimiter>,
     /// Buffered bytes of a partially received OBU.
     pending: Vec<u8>,
+    /// Temporal units pulled since the last reset.
+    units_pulled: u64,
+    /// Parameter subblocks of temporal units that are behind others still
+    /// to be pulled, in arrival order: they join the timelines when their
+    /// unit is pulled, so that a block starts at its own unit however many
+    /// units one `decode` call brought.
+    held_subblocks: VecDeque<HeldSubblock>,
     frame_size: u32,
     ended: bool,
     scratch: UnitScratch,
@@ -766,6 +825,8 @@ impl StreamDecoder {
             norm_gain,
             limiter: None,
             pending: Vec::new(),
+            units_pulled: 0,
+            held_subblocks: VecDeque::new(),
             frame_size,
             ended: false,
             scratch: UnitScratch::default(),
@@ -866,86 +927,120 @@ impl StreamDecoder {
         Ok(())
     }
 
+    /// How many temporal units are waiting to be pulled ahead of the one
+    /// an OBU arriving now belongs to. Between two units every substream
+    /// has as many frames buffered, and the OBU opens the next unit; with
+    /// a unit under way, it belongs to that one.
+    fn units_ahead(&self) -> usize {
+        let depths = || {
+            self.slots
+                .iter()
+                .flat_map(|slot| &slot.queues)
+                .map(VecDeque::len)
+        };
+        let deepest = depths().max().unwrap_or(0);
+        if depths().all(|depth| depth == deepest) {
+            deepest
+        } else {
+            deepest - 1
+        }
+    }
+
+    /// Parses a parameter block and appends its subblocks to the timelines
+    /// of what it drives. A block starts with the temporal unit it comes
+    /// in (§5.1.2), not with whichever unit is pulled next: when units are
+    /// still buffered ahead of its own, its parsed subblocks are held and
+    /// join the timelines when that unit is pulled.
     fn handle_parameter_block(&mut self, payload: &[u8]) -> Result<(), DecodeError> {
         let id = ParameterBlock::peek_parameter_id(payload)
             .map_err(|e| DecodeError::CorruptPacket(e.to_string()))?;
         let sample_rate = self.sample_rate();
+        let ahead = self.units_ahead();
+        let unit = self.units_pulled + ahead as u64;
         // Split borrows: the index is only read while slots/cursors are
         // updated, so no target list needs cloning.
         let StreamDecoder {
             param_index,
             slots,
             output_cursor,
+            held_subblocks,
             ..
         } = self;
         let Some(targets) = param_index.get(&id) else {
             return Ok(());
         };
         let corrupt = |e: Error| DecodeError::CorruptPacket(e.to_string());
+        // A block with several targets is parsed once per target: what
+        // was held of it goes if a later parse fails, as nothing of it
+        // would have been held had the first failed.
+        let held_before = held_subblocks.len();
         for (slot_index, kind, definition) in targets {
             let scale = crate::params::samples_per_tick(sample_rate, definition.parameter_rate);
-            match kind {
+            let block = match kind {
                 ParamKind::Demixing => {
-                    let block = ParameterBlock::parse(payload, definition, &ParamContext::Demixing)
-                        .map_err(corrupt)?;
-                    for sb in &block.subblocks {
-                        if let SubblockData::Demixing { dmixp_mode } = &sb.data {
-                            slots[*slot_index]
-                                .dmx_cursor
-                                .push(*dmixp_mode, (f64::from(sb.duration) * scale) as usize);
-                        }
-                    }
+                    ParameterBlock::parse(payload, definition, &ParamContext::Demixing)
                 }
                 ParamKind::ReconGain => {
-                    let block = {
-                        let AudioElementConfig::ChannelBased { layers } =
-                            &slots[*slot_index].element.config
-                        else {
-                            continue;
-                        };
-                        ParameterBlock::parse(payload, definition, &ParamContext::ReconGain(layers))
-                            .map_err(corrupt)?
+                    let AudioElementConfig::ChannelBased { layers } =
+                        &slots[*slot_index].element.config
+                    else {
+                        continue;
                     };
-                    for sb in block.subblocks {
-                        if let SubblockData::ReconGain(gains) = sb.data {
-                            slots[*slot_index]
-                                .recon_cursor
-                                .push(gains, (f64::from(sb.duration) * scale) as usize);
-                        }
-                    }
+                    ParameterBlock::parse(payload, definition, &ParamContext::ReconGain(layers))
                 }
                 ParamKind::Position => {
-                    let Some(cursor) = slots[*slot_index].position.as_mut() else {
+                    let Some(cursor) = slots[*slot_index].position.as_ref() else {
                         continue;
                     };
                     let context = ParamContext::Position {
                         kind: cursor.kind(),
                         objects: cursor.num_objects(),
                     };
-                    let block =
-                        ParameterBlock::parse(payload, definition, &context).map_err(corrupt)?;
-                    for sb in block.subblocks {
-                        if let SubblockData::Position(data) = sb.data {
-                            cursor.push(data, sb.duration, scale);
-                        }
-                    }
+                    ParameterBlock::parse(payload, definition, &context)
                 }
                 ParamKind::ElementMixGain | ParamKind::OutputMixGain => {
-                    let block = ParameterBlock::parse(payload, definition, &ParamContext::MixGain)
-                        .map_err(corrupt)?;
-                    let cursor = match kind {
-                        ParamKind::ElementMixGain => &mut slots[*slot_index].gain_cursor,
-                        _ => &mut *output_cursor,
-                    };
-                    for sb in &block.subblocks {
-                        if let SubblockData::MixGain(anim) = &sb.data {
-                            cursor.push(anim, (f64::from(sb.duration) * scale) as usize);
-                        }
-                    }
+                    ParameterBlock::parse(payload, definition, &ParamContext::MixGain)
+                }
+            };
+            let block = match block {
+                Ok(block) => block,
+                Err(e) => {
+                    held_subblocks.truncate(held_before);
+                    return Err(corrupt(e));
+                }
+            };
+            let target = match kind {
+                ParamKind::OutputMixGain => ParamTarget::OutputMix,
+                _ => ParamTarget::Slot(*slot_index),
+            };
+            for sb in block.subblocks {
+                let subblock = HeldSubblock {
+                    unit,
+                    target,
+                    data: sb.data,
+                    duration: sb.duration,
+                    scale,
+                };
+                if ahead == 0 {
+                    subblock.join_timeline(slots, output_cursor);
+                } else {
+                    held_subblocks.push_back(subblock);
                 }
             }
         }
         Ok(())
+    }
+
+    /// Hands the timelines the held subblocks of the unit about to be
+    /// pulled.
+    fn release_held_subblocks(&mut self) {
+        while let Some(subblock) = self.held_subblocks.front() {
+            if subblock.unit > self.units_pulled {
+                break;
+            }
+            let subblock = self.held_subblocks.pop_front().expect("checked non-empty");
+            subblock.join_timeline(&mut self.slots, &mut self.output_cursor);
+        }
     }
 
     /// Whether a complete temporal unit is decoded and ready to pull.
@@ -984,6 +1079,8 @@ impl StreamDecoder {
             out.clear();
             return Ok(false);
         }
+        self.release_held_subblocks();
+        self.units_pulled += 1;
         let mut scratch = std::mem::take(&mut self.scratch);
         let rendered = self.render_unit(&mut scratch, out);
         scratch.spare.truncate(SPARE_BUFFERS);
@@ -1413,6 +1510,8 @@ impl StreamDecoder {
     /// kept.
     pub fn reset(&mut self) {
         self.pending.clear();
+        self.units_pulled = 0;
+        self.held_subblocks.clear();
         self.ended = false;
         self.output_cursor = GainCursor::default();
         self.limiter = None;
@@ -1531,6 +1630,8 @@ impl StreamDecoder {
             .collect();
         self.param_index.clear();
         self.pending.clear();
+        self.units_pulled = 0;
+        self.held_subblocks.clear();
         match Self::from_parsed(
             std::mem::take(&mut self.parsed),
             settings,
