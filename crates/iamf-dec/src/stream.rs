@@ -552,6 +552,15 @@ pub struct StreamDecoder {
     limiter: Option<PeakLimiter>,
     /// Buffered bytes of a partially received OBU.
     pending: Vec<u8>,
+    /// Temporal units pulled since the last reset.
+    units_pulled: u64,
+    /// Parameter blocks of temporal units that are behind others still to
+    /// be pulled, with the unit each belongs to: they join the timelines
+    /// when that unit is pulled, so that a block starts at its own unit
+    /// however many units one `decode` call brought.
+    held_blocks: VecDeque<(u64, Vec<u8>)>,
+    /// Payload buffers for the next held blocks.
+    spare_blocks: Vec<Vec<u8>>,
     frame_size: u32,
     ended: bool,
     scratch: UnitScratch,
@@ -766,6 +775,9 @@ impl StreamDecoder {
             norm_gain,
             limiter: None,
             pending: Vec::new(),
+            units_pulled: 0,
+            held_blocks: VecDeque::new(),
+            spare_blocks: Vec::new(),
             frame_size,
             ended: false,
             scratch: UnitScratch::default(),
@@ -807,7 +819,7 @@ impl StreamDecoder {
                             frame.num_samples_to_trim_at_end,
                         )?;
                     } else if obu.header.obu_type == ObuType::ParameterBlock {
-                        self.handle_parameter_block(obu.payload)?;
+                        self.receive_parameter_block(obu.payload)?;
                     } else if obu.header.obu_type == ObuType::TemporalDelimiter {
                         self.check_unit_alignment()?;
                     }
@@ -866,7 +878,61 @@ impl StreamDecoder {
         Ok(())
     }
 
-    fn handle_parameter_block(&mut self, payload: &[u8]) -> Result<(), DecodeError> {
+    /// How many temporal units are waiting to be pulled ahead of the one
+    /// an OBU arriving now belongs to. Between two units every substream
+    /// has as many frames buffered, and the OBU opens the next unit; with
+    /// a unit under way, it belongs to that one.
+    fn units_ahead(&self) -> usize {
+        let depths = || {
+            self.slots
+                .iter()
+                .flat_map(|slot| &slot.queues)
+                .map(VecDeque::len)
+        };
+        let deepest = depths().max().unwrap_or(0);
+        if depths().all(|depth| depth == deepest) {
+            deepest
+        } else {
+            deepest - 1
+        }
+    }
+
+    /// A parameter block starts with the temporal unit it comes in
+    /// (§5.1.2), not with whichever unit is pulled next: when units are
+    /// still buffered ahead of its own, it is checked now and held until
+    /// its unit is pulled.
+    fn receive_parameter_block(&mut self, payload: &[u8]) -> Result<(), DecodeError> {
+        let ahead = self.units_ahead();
+        if ahead == 0 {
+            return self.handle_parameter_block(payload, true);
+        }
+        self.handle_parameter_block(payload, false)?;
+        let mut held = self.spare_blocks.pop().unwrap_or_default();
+        held.clear();
+        held.extend_from_slice(payload);
+        self.held_blocks
+            .push_back((self.units_pulled + ahead as u64, held));
+        Ok(())
+    }
+
+    /// Hands the timelines the held parameter blocks of the unit about to
+    /// be pulled.
+    fn release_held_blocks(&mut self) -> Result<(), DecodeError> {
+        while let Some((unit, _)) = self.held_blocks.front() {
+            if *unit > self.units_pulled {
+                break;
+            }
+            let (_, payload) = self.held_blocks.pop_front().expect("checked non-empty");
+            let handled = self.handle_parameter_block(&payload, true);
+            self.spare_blocks.push(payload);
+            handled?;
+        }
+        Ok(())
+    }
+
+    /// Parses a parameter block and, with `apply`, appends it to the
+    /// timelines of what it drives; without, it is only checked.
+    fn handle_parameter_block(&mut self, payload: &[u8], apply: bool) -> Result<(), DecodeError> {
         let id = ParameterBlock::peek_parameter_id(payload)
             .map_err(|e| DecodeError::CorruptPacket(e.to_string()))?;
         let sample_rate = self.sample_rate();
@@ -888,6 +954,9 @@ impl StreamDecoder {
                 ParamKind::Demixing => {
                     let block = ParameterBlock::parse(payload, definition, &ParamContext::Demixing)
                         .map_err(corrupt)?;
+                    if !apply {
+                        continue;
+                    }
                     for sb in &block.subblocks {
                         if let SubblockData::Demixing { dmixp_mode } = &sb.data {
                             slots[*slot_index]
@@ -906,6 +975,9 @@ impl StreamDecoder {
                         ParameterBlock::parse(payload, definition, &ParamContext::ReconGain(layers))
                             .map_err(corrupt)?
                     };
+                    if !apply {
+                        continue;
+                    }
                     for sb in block.subblocks {
                         if let SubblockData::ReconGain(gains) = sb.data {
                             slots[*slot_index]
@@ -924,6 +996,9 @@ impl StreamDecoder {
                     };
                     let block =
                         ParameterBlock::parse(payload, definition, &context).map_err(corrupt)?;
+                    if !apply {
+                        continue;
+                    }
                     for sb in block.subblocks {
                         if let SubblockData::Position(data) = sb.data {
                             cursor.push(data, sb.duration, scale);
@@ -937,6 +1012,9 @@ impl StreamDecoder {
                         ParamKind::ElementMixGain => &mut slots[*slot_index].gain_cursor,
                         _ => &mut *output_cursor,
                     };
+                    if !apply {
+                        continue;
+                    }
                     for sb in &block.subblocks {
                         if let SubblockData::MixGain(anim) = &sb.data {
                             cursor.push(anim, (f64::from(sb.duration) * scale) as usize);
@@ -984,8 +1062,10 @@ impl StreamDecoder {
             out.clear();
             return Ok(false);
         }
+        let released = self.release_held_blocks();
+        self.units_pulled += 1;
         let mut scratch = std::mem::take(&mut self.scratch);
-        let rendered = self.render_unit(&mut scratch, out);
+        let rendered = released.and_then(|()| self.render_unit(&mut scratch, out));
         scratch.spare.truncate(SPARE_BUFFERS);
         self.scratch = scratch;
         if rendered.is_err() {
@@ -1413,6 +1493,9 @@ impl StreamDecoder {
     /// kept.
     pub fn reset(&mut self) {
         self.pending.clear();
+        self.units_pulled = 0;
+        self.spare_blocks
+            .extend(self.held_blocks.drain(..).map(|(_, payload)| payload));
         self.ended = false;
         self.output_cursor = GainCursor::default();
         self.limiter = None;
@@ -1531,6 +1614,9 @@ impl StreamDecoder {
             .collect();
         self.param_index.clear();
         self.pending.clear();
+        self.units_pulled = 0;
+        self.spare_blocks
+            .extend(self.held_blocks.drain(..).map(|(_, payload)| payload));
         match Self::from_parsed(
             std::mem::take(&mut self.parsed),
             settings,

@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+Raw streams decoded whatever the size of the pushes:
+
+- `iamf-obu`: the OBU header's second flag is read as
+  `obu_trimming_status_flag` on audio frames only. A temporal delimiter
+  with IAMF v2.0's `is_not_key_frame` set was taken for an OBU with
+  trimming fields it does not have, and the stream stopped decoding at
+  the first non-key temporal unit.
+- `iamf-dec`: a parameter block starts at the temporal unit it comes in.
+  `StreamDecoder::decode` appended every block to its timeline at once,
+  so with several units in one call a block was applied from the first
+  unit not yet pulled, and a gap between two blocks (default values)
+  moved to the end of the call. Blocks of units behind others still to
+  be pulled are now held until their unit is pulled.
+- Tests: `tools/iamfdec/tests/synthetic.rs`, a gain block with gaps
+  around it, pushed whole, per unit, in pairs and in 37-byte pieces, with
+  and without delimiters.
+
 Split elements, for a player that adjusts or places an element itself:
 
 - `StreamDecoder::split_element(audio_element_id)`: a channel-based

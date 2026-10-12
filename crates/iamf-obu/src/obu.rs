@@ -92,7 +92,11 @@ impl<'a> Obu<'a> {
         let byte = reader.read_u8()?;
         let obu_type = ObuType::from_raw(byte >> 3, header_offset)?;
         let redundant_copy = byte & 0x04 != 0;
-        let trimming_status_flag = byte & 0x02 != 0;
+        // The bit is obu_trimming_status_flag on audio frames only. On a
+        // temporal delimiter it is IAMF v2.0's is_not_key_frame, on a mix
+        // presentation its optional_fields_flag, and reserved elsewhere:
+        // none of those is followed by trimming fields.
+        let trimming_status_flag = obu_type.is_audio_frame() && byte & 0x02 != 0;
         let extension_flag = byte & 0x01 != 0;
 
         let obu_size = reader.read_leb128()? as usize;
@@ -182,6 +186,31 @@ mod tests {
         assert_eq!(obu.header.obu_type, ObuType::SequenceHeader);
         assert!(!obu.header.redundant_copy);
         assert_eq!(obu.payload, b"iamf");
+    }
+
+    #[test]
+    fn a_non_key_frame_delimiter_has_no_trimming_fields() {
+        // obu_type=4 with bit 0x02 (v2.0 is_not_key_frame) and an empty
+        // body, followed by an audio frame: the delimiter is complete as
+        // it stands, not an OBU waiting for two leb128 trims.
+        let mut data = obu_bytes((4 << 3) | 0x02, &[]);
+        data.extend(obu_bytes(6 << 3, &[0xAA]));
+        let obus: Vec<_> = ObuIter::new(&data).collect::<Result<_>>().unwrap();
+        assert_eq!(obus.len(), 2);
+        assert_eq!(obus[0].header.obu_type, ObuType::TemporalDelimiter);
+        assert_eq!(obus[0].header.num_samples_to_trim_at_end, 0);
+        assert_eq!(obus[0].header.num_samples_to_trim_at_start, 0);
+        assert!(obus[0].payload.is_empty());
+        assert_eq!(obus[1].payload, &[0xAA]);
+    }
+
+    #[test]
+    fn the_trimming_bit_is_not_read_off_a_parameter_block() {
+        // obu_type=3 with the (reserved) bit set: the body is all payload.
+        let data = obu_bytes((3 << 3) | 0x02, &[0x7F, 0x01]);
+        let obus: Vec<_> = ObuIter::new(&data).collect::<Result<_>>().unwrap();
+        assert_eq!(obus[0].header.num_samples_to_trim_at_end, 0);
+        assert_eq!(obus[0].payload, &[0x7F, 0x01]);
     }
 
     #[test]
